@@ -1,0 +1,8 @@
+[package]
+name = "neko-ai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+burn = { version = "0.20.1", features = ["cpu", "webgpu", "vulkan", "ndarray"] }
+eframe = "0.33.3"
