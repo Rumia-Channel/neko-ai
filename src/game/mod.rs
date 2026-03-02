@@ -27,6 +27,7 @@ impl Player {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_cell(&self) -> Cell {
         match self {
             Player::Black => Cell::Black,
