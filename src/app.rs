@@ -124,7 +124,12 @@ impl GameApp {
         // AI difficulty selection (only show if AI is involved)
         if self.game_mode != GameMode::HumanVsHuman {
             ui.label("AIの難易度:");
-            for difficulty in [AiDifficulty::Easy, AiDifficulty::Medium, AiDifficulty::Hard] {
+            for difficulty in [
+                AiDifficulty::Easy,
+                AiDifficulty::Medium,
+                AiDifficulty::SlightlyHard,
+                AiDifficulty::Hard,
+            ] {
                 ui.radio_value(&mut self.ai_difficulty, difficulty, difficulty.as_str());
             }
             ui.add_space(10.0);

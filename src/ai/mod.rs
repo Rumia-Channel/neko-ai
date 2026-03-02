@@ -1,8 +1,10 @@
 use crate::game::{BOARD_SIZE, Game, Player};
 
 pub mod monte_carlo;
+pub mod restrictive;
 
 pub use monte_carlo::MonteCarloAi;
+pub use restrictive::RestrictiveAi;
 
 /// AIプレイヤーのインターフェース
 /// ゲーム状態を受け取り、最適な手（row, col）を返す
@@ -60,9 +62,10 @@ impl AiPlayer for RandomAi {
 /// AIの難易度レベル
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AiDifficulty {
-    Easy,   // ランダム
-    Medium, // 簡易的な評価関数
-    Hard,   // Minimaxなど
+    Easy,         // 3手先、石数最大化
+    Medium,       // 5手先、石数最大化
+    SlightlyHard, // 5手先、相手の選択肢最小化
+    Hard,         // Minimaxなど
 }
 
 impl AiDifficulty {
@@ -70,6 +73,7 @@ impl AiDifficulty {
         match self {
             AiDifficulty::Easy => "簡単",
             AiDifficulty::Medium => "普通",
+            AiDifficulty::SlightlyHard => "少し難しい",
             AiDifficulty::Hard => "難しい",
         }
     }
@@ -82,6 +86,10 @@ pub fn create_ai(difficulty: AiDifficulty, player: Player) -> Box<dyn AiPlayer> 
         AiDifficulty::Medium => {
             // 5手先を読むモンテカルロ法（シミュレーション回数増加）
             Box::new(MonteCarloAi::with_config(player, 5, 500))
+        }
+        AiDifficulty::SlightlyHard => {
+            // 5手先で相手の選択肢を最小化する戦略
+            Box::new(RestrictiveAi::new(player))
         }
         AiDifficulty::Hard => Box::new(RandomAi::new(player)), // TODO: Minimax AIを実装
     }
