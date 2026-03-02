@@ -18,7 +18,7 @@ fn main() -> eframe::Result {
             let mut fonts = egui::FontDefinitions::default();
 
             // Load the custom font data
-            let font_data = include_bytes!("../fonts/GDhwGoJA-OTF112b2.otf");
+            let font_data = include_bytes!("../fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf");
             fonts.font_data.insert(
                 "japanese_font".to_owned(),
                 egui::FontData::from_owned(font_data.to_vec()).into(),
