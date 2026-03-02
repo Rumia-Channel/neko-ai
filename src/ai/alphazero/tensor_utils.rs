@@ -1,4 +1,4 @@
-use crate::game::{Cell, Game, Player, BOARD_SIZE};
+use crate::game::{BOARD_SIZE, Cell, Game, Player};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 

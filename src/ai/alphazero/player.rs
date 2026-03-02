@@ -2,9 +2,9 @@
 //!
 //! Combines MCTS with neural network guidance to play Othello.
 
+use crate::ai::AiPlayer;
 use crate::ai::alphazero::mcts::{MctsConfig, MctsSearch};
 use crate::ai::alphazero::model::AlphaZeroModel;
-use crate::ai::AiPlayer;
 use crate::game::{Game, Player};
 use burn::tensor::backend::Backend;
 

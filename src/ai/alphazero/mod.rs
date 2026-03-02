@@ -13,6 +13,7 @@ pub mod self_play;
 pub mod tensor_utils;
 pub mod training;
 
+pub use mcts::{MctsConfig, MctsSearch};
 pub use model::{AlphaZeroModel, AlphaZeroModelConfig};
-pub use self_play::{SelfPlayConfig, SelfPlayEngine};
+pub use self_play::{SelfPlayConfig, SelfPlayEngine, TrainingExample};
 pub use training::{Trainer, TrainingConfig};

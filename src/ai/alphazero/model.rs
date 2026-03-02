@@ -1,8 +1,8 @@
 use burn::config::Config;
 use burn::module::Module;
-use burn::nn::{conv::Conv2d, conv::Conv2dConfig, Linear, LinearConfig, Relu};
-use burn::tensor::backend::Backend;
+use burn::nn::{Linear, LinearConfig, Relu, conv::Conv2d, conv::Conv2dConfig};
 use burn::tensor::Tensor;
+use burn::tensor::backend::Backend;
 
 use crate::game::BOARD_SIZE;
 
