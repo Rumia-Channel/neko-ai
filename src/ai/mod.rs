@@ -79,8 +79,11 @@ impl AiDifficulty {
 pub fn create_ai(difficulty: AiDifficulty, player: Player) -> Box<dyn AiPlayer> {
     match difficulty {
         AiDifficulty::Easy => Box::new(MonteCarloAi::new(player)),
-        AiDifficulty::Medium => Box::new(RandomAi::new(player)), // TODO: より良いAIを実装
-        AiDifficulty::Hard => Box::new(RandomAi::new(player)),   // TODO: Minimax AIを実装
+        AiDifficulty::Medium => {
+            // 5手先を読むモンテカルロ法（シミュレーション回数増加）
+            Box::new(MonteCarloAi::with_config(player, 5, 500))
+        }
+        AiDifficulty::Hard => Box::new(RandomAi::new(player)), // TODO: Minimax AIを実装
     }
 }
 

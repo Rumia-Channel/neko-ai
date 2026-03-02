@@ -9,13 +9,13 @@ use crate::ai::AiPlayer;
 use crate::game::{BOARD_SIZE, Game, Player};
 use rand::seq::IteratorRandom;
 
-/// Monte Carlo AI that looks ahead 3 moves
+/// Monte Carlo AI that looks ahead N moves
 #[derive(Debug)]
 pub struct MonteCarloAi {
     player: Player,
     /// Number of simulations per move evaluation
     simulations: usize,
-    /// Maximum depth to simulate (3 moves)
+    /// Maximum depth to simulate
     max_depth: usize,
 }
 
@@ -23,8 +23,17 @@ impl MonteCarloAi {
     pub fn new(player: Player) -> Self {
         Self {
             player,
-            simulations: 100, // Number of random playouts per move
+            simulations: 300, // Number of random playouts per move
             max_depth: 3,     // Look ahead 3 moves
+        }
+    }
+
+    /// Create AI with custom depth and simulations
+    pub fn with_config(player: Player, depth: usize, simulations: usize) -> Self {
+        Self {
+            player,
+            simulations,
+            max_depth: depth,
         }
     }
 

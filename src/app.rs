@@ -144,8 +144,8 @@ impl GameApp {
 
 impl eframe::App for GameApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle AI turns
-        if self.is_ai_turn() && !self.thinking {
+        // Handle AI turns (only when not in settings)
+        if !self.show_settings && self.is_ai_turn() && !self.thinking {
             // Add a small delay for AI moves so it's visible
             let should_move = match self.last_ai_move_time {
                 None => true,
@@ -164,6 +164,10 @@ impl eframe::App for GameApp {
                         Some(create_ai(self.ai_difficulty, self.game.current_player()));
                 }
             }
+
+            // Request continuous repaint for AI vs AI mode so it runs automatically
+            // without requiring mouse movement
+            ctx.request_repaint();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
