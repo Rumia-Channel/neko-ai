@@ -83,8 +83,7 @@ impl GameApp {
             self.ai_player.as_ref(),
             self.ai_player
                 .as_ref()
-                .unwrap()
-                .choose_move(self.game.as_ref()),
+                .and_then(|ai| ai.choose_move(self.game.as_ref())),
         ) {
             let _ = ai;
             self.game.make_move(row, col);

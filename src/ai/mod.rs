@@ -1,5 +1,9 @@
 use crate::game::{BOARD_SIZE, Game, Player};
 
+pub mod monte_carlo;
+
+pub use monte_carlo::MonteCarloAi;
+
 /// AIプレイヤーのインターフェース
 /// ゲーム状態を受け取り、最適な手（row, col）を返す
 pub trait AiPlayer: Send + std::fmt::Debug {
@@ -74,7 +78,7 @@ impl AiDifficulty {
 /// AIプレイヤーを生成するファクトリ関数
 pub fn create_ai(difficulty: AiDifficulty, player: Player) -> Box<dyn AiPlayer> {
     match difficulty {
-        AiDifficulty::Easy => Box::new(RandomAi::new(player)),
+        AiDifficulty::Easy => Box::new(MonteCarloAi::new(player)),
         AiDifficulty::Medium => Box::new(RandomAi::new(player)), // TODO: より良いAIを実装
         AiDifficulty::Hard => Box::new(RandomAi::new(player)),   // TODO: Minimax AIを実装
     }

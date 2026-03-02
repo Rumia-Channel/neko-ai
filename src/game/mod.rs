@@ -4,6 +4,11 @@ pub mod othello;
 
 pub use othello::OthelloGame;
 
+/// Trait for cloning boxed Game trait objects
+pub trait CloneGame {
+    fn clone_box(&self) -> Box<dyn Game>;
+}
+
 pub const BOARD_SIZE: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -36,7 +41,7 @@ impl Player {
     }
 }
 
-pub trait Game: Send + Debug {
+pub trait Game: Send + Debug + CloneGame {
     fn name(&self) -> &'static str;
 
     fn board(&self) -> &[[Cell; BOARD_SIZE]; BOARD_SIZE];

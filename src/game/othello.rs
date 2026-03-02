@@ -1,6 +1,6 @@
 use super::{BOARD_SIZE, Cell, Game, Player};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OthelloGame {
     board: [[Cell; BOARD_SIZE]; BOARD_SIZE],
     current_player: Player,
@@ -87,6 +87,12 @@ impl OthelloGame {
                 }
             }
         }
+    }
+}
+
+impl super::CloneGame for OthelloGame {
+    fn clone_box(&self) -> Box<dyn Game> {
+        Box::new(self.clone())
     }
 }
 
