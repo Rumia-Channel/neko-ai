@@ -1,8 +1,11 @@
 use crate::game::{BOARD_SIZE, Game, Player};
 
+pub mod alphazero;
+pub mod honrou;
 pub mod monte_carlo;
 pub mod restrictive;
 
+pub use honrou::HonrouAi;
 pub use monte_carlo::MonteCarloAi;
 pub use restrictive::RestrictiveAi;
 
@@ -66,6 +69,7 @@ pub enum AiDifficulty {
     Medium,       // 5手先、石数最大化
     SlightlyHard, // 5手先、相手の選択肢最小化
     Hard,         // Minimaxなど
+    Honrou,       // 翻弄 - 最上級難易度
 }
 
 impl AiDifficulty {
@@ -75,6 +79,7 @@ impl AiDifficulty {
             AiDifficulty::Medium => "普通",
             AiDifficulty::SlightlyHard => "少し難しい",
             AiDifficulty::Hard => "難しい",
+            AiDifficulty::Honrou => "翻弄",
         }
     }
 }
@@ -92,6 +97,7 @@ pub fn create_ai(difficulty: AiDifficulty, player: Player) -> Box<dyn AiPlayer> 
             Box::new(RestrictiveAi::new(player))
         }
         AiDifficulty::Hard => Box::new(RandomAi::new(player)), // TODO: Minimax AIを実装
+        AiDifficulty::Honrou => Box::new(HonrouAi::new(player)),
     }
 }
 

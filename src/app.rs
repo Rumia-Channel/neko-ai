@@ -129,6 +129,7 @@ impl GameApp {
                 AiDifficulty::Medium,
                 AiDifficulty::SlightlyHard,
                 AiDifficulty::Hard,
+                AiDifficulty::Honrou,
             ] {
                 ui.radio_value(&mut self.ai_difficulty, difficulty, difficulty.as_str());
             }
