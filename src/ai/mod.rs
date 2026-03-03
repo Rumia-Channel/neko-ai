@@ -5,27 +5,6 @@ pub mod honrou;
 pub mod monte_carlo;
 pub mod restrictive;
 
-/// Evaluate corner control penalty
-/// Returns a penalty value (0.0 to -1.0) based on how many corners the opponent controls
-/// Four corners: (0,0), (0,7), (7,0), (7,7)
-/// Each corner controlled by opponent gives -0.25 penalty (max -1.0 for all 4 corners)
-pub fn evaluate_corner_penalty(game: &dyn Game, player: Player) -> f32 {
-    let board = game.board();
-    let opponent = player.opposite();
-    let opponent_cell = opponent.to_cell();
-
-    let corners = [(0, 0), (0, 7), (7, 0), (7, 7)];
-    let mut penalty = 0.0f32;
-
-    for (row, col) in corners {
-        if board[row][col] == opponent_cell {
-            penalty -= 0.25; // 各四隅で-0.25のペナルティ
-        }
-    }
-
-    penalty
-}
-
 pub use honrou::HonrouAi;
 pub use monte_carlo::MonteCarloAi;
 pub use restrictive::RestrictiveAi;
