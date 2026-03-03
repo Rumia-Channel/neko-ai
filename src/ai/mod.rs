@@ -9,6 +9,14 @@ pub use honrou::HonrouAi;
 pub use monte_carlo::MonteCarloAi;
 pub use restrictive::RestrictiveAi;
 
+/// Path to the trained model file (safetensors format)
+#[allow(dead_code)]
+pub const DEFAULT_MODEL_PATH: &str = "checkpoints/best_model";
+
+// Note: Model serialization requires additional burn configuration.
+// The save/load functionality is prepared but may need API adjustments
+// based on your specific burn version and backend.
+
 /// AIプレイヤーのインターフェース
 /// ゲーム状態を受け取り、最適な手（row, col）を返す
 pub trait AiPlayer: Send + std::fmt::Debug {

@@ -3,6 +3,7 @@ use burn::module::Module;
 use burn::nn::{Linear, LinearConfig, Relu, conv::Conv2d, conv::Conv2dConfig};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
+use std::path::Path;
 
 use crate::game::BOARD_SIZE;
 

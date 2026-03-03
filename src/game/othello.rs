@@ -30,6 +30,24 @@ impl Default for OthelloGame {
 }
 
 impl OthelloGame {
+    /// Pass the current turn when no valid moves are available.
+    pub fn pass_turn(&mut self) {
+        if self.game_over {
+            return;
+        }
+
+        // Switch to opponent.
+        self.current_player = self.current_player.opposite();
+
+        // If opponent also has no valid moves, the game is over.
+        if !self.has_valid_moves(self.current_player) {
+            self.current_player = self.current_player.opposite();
+            if !self.has_valid_moves(self.current_player) {
+                self.game_over = true;
+            }
+        }
+    }
+
     fn check_direction(
         &self,
         row: usize,

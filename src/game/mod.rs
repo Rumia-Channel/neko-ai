@@ -11,14 +11,14 @@ pub trait CloneGame {
 
 pub const BOARD_SIZE: usize = 8;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Cell {
     Empty,
     Black,
     White,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Player {
     Black,
     White,
