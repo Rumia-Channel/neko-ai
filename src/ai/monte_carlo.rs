@@ -5,7 +5,7 @@
 //! 2. Evaluate the resulting board position by stone count
 //! 3. Select the move with the best average outcome
 
-use crate::ai::AiPlayer;
+use crate::ai::{AiPlayer, evaluate_corner_penalty};
 use crate::game::{BOARD_SIZE, Game, Player};
 use rand::seq::IteratorRandom;
 
@@ -103,8 +103,12 @@ impl MonteCarloAi {
             (my_count as f32 - opponent_count as f32) / total_stones as f32
         };
 
+        // 四隅が取られると大幅減点
+        let corner_penalty = evaluate_corner_penalty(game, self.player);
+        let adjusted_score = score + corner_penalty;
+
         // Normalize to 0-1 range for easier comparison
-        (score + 1.0) / 2.0
+        (adjusted_score + 1.0) / 2.0
     }
 }
 

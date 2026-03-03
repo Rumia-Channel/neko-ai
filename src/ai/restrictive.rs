@@ -23,8 +23,8 @@ impl RestrictiveAi {
     pub fn new(player: Player) -> Self {
         Self {
             player,
-            simulations: 500, // More simulations for better evaluation
-            max_depth: 5,     // Look ahead 5 moves
+            simulations: 2000, // More simulations for better evaluation
+            max_depth: 5,      // Look ahead 5 moves
         }
     }
 
@@ -40,20 +40,49 @@ impl RestrictiveAi {
 
     /// Evaluate a move by running Monte Carlo simulations
     /// Returns a score where higher is better (lower opponent mobility)
+    /// Heavily penalizes moves that give opponent access to corners
     fn evaluate_move(&self, game: &dyn Game, row: usize, col: usize) -> f32 {
+        // First, check if this move gives opponent a corner opportunity
+        let mut immediate_game = game.clone_box();
+        immediate_game.make_move(row, col);
+
+        // Check if opponent can take any corners after this move
+        let corner_penalty = self.evaluate_corner_vulnerability(&*immediate_game);
+
+        // Run Monte Carlo simulations
         let mut total_score = 0.0;
 
         for _ in 0..self.simulations {
-            // Create a copy of the game state and make the move
-            let mut sim_game = game.clone_box();
-            sim_game.make_move(row, col);
+            // Create a copy of the game state after the move
+            let mut sim_game = immediate_game.clone_box();
 
             // Simulate random play for remaining depth
             let score = self.simulate_playout(sim_game.as_mut(), 1);
             total_score += score;
         }
 
-        total_score / self.simulations as f32
+        let avg_score = total_score / self.simulations as f32;
+
+        // Apply heavy penalty for giving opponent corner opportunities
+        // This prioritizes avoiding corner giveaways over other factors
+        avg_score + corner_penalty
+    }
+
+    /// Check if opponent can take any corners after current move
+    /// Returns a large negative penalty if corners are vulnerable
+    fn evaluate_corner_vulnerability(&self, game: &dyn Game) -> f32 {
+        let _opponent = self.player.opposite();
+        let corners = [(0, 0), (0, 7), (7, 0), (7, 7)];
+        let mut penalty = 0.0f32;
+
+        for (row, col) in corners {
+            if game.is_valid_move(row, col) {
+                // Opponent can take this corner - heavy penalty!
+                penalty -= 2.0; // 各四隅に-2.0のペナルティ
+            }
+        }
+
+        penalty
     }
 
     /// Simulate random play from current state to max_depth

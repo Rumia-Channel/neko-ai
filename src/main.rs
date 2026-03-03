@@ -191,8 +191,8 @@ fn run_training_mode_gpu() {
 
         // Create self-play engine
         println!("\nInitializing self-play engine with GPU...");
-    let mcts = MctsSearch::new(self_play_config.mcts_config, model, device);
-        let self_play = SelfPlayEngine::new(self_play_config, mcts, device);
+        let mcts = MctsSearch::new(self_play_config.mcts_config, model, device.clone());
+        let self_play = SelfPlayEngine::new(self_play_config, mcts, device.clone());
 
         // Generate training data
         println!("\n--- Starting Self-Play ---");
