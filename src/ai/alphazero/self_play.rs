@@ -6,7 +6,6 @@ use crate::ai::alphazero::mcts::{MctsConfig, MctsSearch, select_move};
 use crate::ai::alphazero::tensor_utils::game_to_tensor;
 use crate::game::{BOARD_SIZE, Game, OthelloGame, Player};
 use burn::tensor::backend::Backend;
-use std::collections::VecDeque;
 
 /// Configuration for self-play
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +116,7 @@ impl<B: Backend> SelfPlayEngine<B> {
     /// Play a single game and return training examples
     fn play_one_game(&self) -> Vec<TrainingExample> {
         let mut game = OthelloGame::default();
-        let mut history: VecDeque<(Vec<f32>, Vec<f32>, Player)> = VecDeque::new();
+        let mut history: Vec<(Vec<f32>, Vec<f32>, Player)> = Vec::new();
         let mut move_count = 0usize;
 
         while !game.is_game_over() && move_count < self.config.max_moves_per_game {
@@ -141,11 +140,11 @@ impl<B: Backend> SelfPlayEngine<B> {
                 let (row, col) = valid_moves[0];
                 vec![(row, col, 1.0)]
             } else {
-                self.mcts.search(&game)
+                self.mcts.search_othello(&game)
             };
             let target_policy = self.move_probs_to_policy(&move_probs);
 
-            history.push_back((board_tensor, target_policy, game.current_player()));
+            history.push((board_tensor, target_policy, game.current_player()));
 
             if let Some((row, col)) = select_move(&move_probs, temperature) {
                 game.make_move(row, col);

@@ -52,6 +52,14 @@ pub fn board_to_tensor<B: Backend>(
 
 /// Convert board and current player to neural network input
 pub fn game_to_tensor<B: Backend>(game: &dyn Game, device: &B::Device) -> Tensor<B, 4> {
+    game_to_tensor_for(game, device)
+}
+
+/// Generic version of `game_to_tensor` to avoid trait-object dispatch when possible.
+pub fn game_to_tensor_for<B: Backend, G: Game + ?Sized>(
+    game: &G,
+    device: &B::Device,
+) -> Tensor<B, 4> {
     let board = game.board();
     let current = game.current_player();
 

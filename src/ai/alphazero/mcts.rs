@@ -1,32 +1,33 @@
-//! Complete Monte Carlo Tree Search implementation for AlphaZero
+//! Monte Carlo Tree Search implementation for AlphaZero
 //!
-//! Features:
-//! - Tree structure with proper node management
-//! - PUCT based child selection
-//! - Optional Dirichlet noise for exploration
-//! - Evaluation cache to avoid duplicated NN inference
+//! Optimized for practical speed:
+//! - `Vec`-based children (no hashmap lookup per edge)
+//! - optional time budget / early stop
+//! - single-move short-circuit
+//! - evaluation cache
 
 use crate::ai::alphazero::model::AlphaZeroModel;
-use crate::ai::alphazero::tensor_utils::game_to_tensor;
-use crate::game::{BOARD_SIZE, Cell, Game, Player};
+use crate::ai::alphazero::tensor_utils::game_to_tensor_for;
+use crate::game::{BOARD_SIZE, Cell, Game, OthelloGame, Player};
 use burn::tensor::activation::softmax;
 use burn::tensor::backend::Backend;
 use rand::RngExt;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// MCTS configuration
 #[derive(Debug, Clone, Copy)]
 pub struct MctsConfig {
-    /// Number of simulations to run (default: 800)
+    /// Number of simulations to run.
     pub num_simulations: usize,
-    /// Dirichlet noise alpha for exploration (default: 0.3)
+    /// Dirichlet noise alpha for exploration.
     pub dirichlet_alpha: f32,
-    /// Dirichlet noise weight (default: 0.25)
+    /// Dirichlet noise weight.
     pub dirichlet_weight: f32,
-    /// Temperature for move selection (default: 1.0, 0.0 for greedy)
+    /// Temperature for move selection.
     pub temperature: f32,
-    /// C_puct constant for UCB formula (default: 1.0)
+    /// C_puct constant for PUCT formula.
     pub c_puct: f32,
     /// Whether root Dirichlet noise is applied.
     pub add_root_dirichlet_noise: bool,
@@ -34,19 +35,31 @@ pub struct MctsConfig {
     pub enable_progress_log: bool,
     /// Max number of cached evaluations. Cache is cleared when limit is reached.
     pub eval_cache_size: usize,
+    /// If only one valid move exists, skip MCTS and return immediately.
+    pub skip_single_move_search: bool,
+    /// Optional per-search time budget.
+    pub max_search_time_ms: Option<u64>,
+    /// Minimum simulations before time/ratio early stop can trigger.
+    pub min_simulations_before_stop: usize,
+    /// Early stop when best move visit ratio reaches this value.
+    pub early_stop_visit_ratio: Option<f32>,
 }
 
 impl Default for MctsConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 800,
+            num_simulations: 600,
             dirichlet_alpha: 0.3,
             dirichlet_weight: 0.25,
             temperature: 1.0,
-            c_puct: 1.0,
+            c_puct: 1.2,
             add_root_dirichlet_noise: false,
             enable_progress_log: false,
             eval_cache_size: 50_000,
+            skip_single_move_search: true,
+            max_search_time_ms: Some(120),
+            min_simulations_before_stop: 96,
+            early_stop_visit_ratio: Some(0.92),
         }
     }
 }
@@ -64,6 +77,12 @@ struct CachedEvaluation {
     value: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct MctsChild {
+    move_idx: u8,
+    node: MctsNode,
+}
+
 /// Tree node for MCTS
 #[derive(Debug, Clone)]
 pub struct MctsNode {
@@ -77,8 +96,8 @@ pub struct MctsNode {
     pub is_terminal: bool,
     /// Terminal value if game is over
     pub terminal_value: Option<f32>,
-    /// Child nodes keyed by move index
-    pub children: HashMap<usize, MctsNode>,
+    /// Child nodes
+    pub children: Vec<MctsChild>,
 }
 
 impl MctsNode {
@@ -89,7 +108,7 @@ impl MctsNode {
             prior,
             is_terminal: false,
             terminal_value: None,
-            children: HashMap::new(),
+            children: Vec::new(),
         }
     }
 
@@ -100,11 +119,11 @@ impl MctsNode {
             prior: 0.0,
             is_terminal: true,
             terminal_value: Some(value),
-            children: HashMap::new(),
+            children: Vec::new(),
         }
     }
 
-    /// Get Q-value (average value) from the perspective of this node's current player.
+    /// Get Q-value (average value) from this node player's perspective.
     pub fn q_value(&self) -> f32 {
         if self.visit_count == 0 {
             0.0
@@ -133,95 +152,179 @@ impl<B: Backend> MctsSearch<B> {
         }
     }
 
-    /// Perform MCTS search and return move probabilities
+    /// Generic search entrypoint (works for any Game trait object).
     pub fn search(&self, game: &dyn Game) -> Vec<(usize, usize, f32)> {
-        let mut root = self.evaluate_node(game);
+        self.search_dyn(game)
+    }
 
+    /// Specialized search for OthelloGame to avoid clone_box overhead.
+    pub fn search_othello(&self, game: &OthelloGame) -> Vec<(usize, usize, f32)> {
+        self.search_typed(game)
+    }
+
+    fn search_dyn(&self, game: &dyn Game) -> Vec<(usize, usize, f32)> {
+        let mut root = self.evaluate_node(game);
         if root.children.is_empty() {
             return Vec::new();
         }
 
-        // Add Dirichlet noise to root for exploration (self-play).
+        if self.config.skip_single_move_search && root.children.len() == 1 {
+            let idx = root.children[0].move_idx as usize;
+            return vec![(idx / BOARD_SIZE, idx % BOARD_SIZE, 1.0)];
+        }
+
         if self.config.add_root_dirichlet_noise {
             self.add_dirichlet_noise(&mut root);
         }
 
-        let num_simulations = self.config.num_simulations;
-        for i in 0..num_simulations {
+        let start = Instant::now();
+        let mut path: Vec<usize> = Vec::with_capacity(64);
+
+        for simulation in 0..self.config.num_simulations {
             if self.config.enable_progress_log
-                && num_simulations >= 10
-                && i % (num_simulations / 10) == 0
-                && i > 0
+                && self.config.num_simulations >= 10
+                && simulation % (self.config.num_simulations / 10) == 0
+                && simulation > 0
             {
                 println!(
                     "    MCTS progress: {}/{} simulations ({}%)",
-                    i,
-                    num_simulations,
-                    (i * 100) / num_simulations
+                    simulation,
+                    self.config.num_simulations,
+                    (simulation * 100) / self.config.num_simulations
                 );
             }
 
+            path.clear();
             let mut game_copy = game.clone_box();
-            let mut path: Vec<usize> = Vec::new();
 
-            // Selection: traverse tree to leaf.
+            // Selection
             let mut current = &mut root;
             while !current.children.is_empty() {
-                let parent_visits = current.visit_count;
-                let best_move = self.select_best_child(current, parent_visits);
+                let child_index = self.select_best_child_index(current);
+                let move_idx = current.children[child_index].move_idx as usize;
+                path.push(child_index);
 
-                path.push(best_move);
-                game_copy.make_move(best_move / BOARD_SIZE, best_move % BOARD_SIZE);
-
-                current = current
-                    .children
-                    .get_mut(&best_move)
-                    .expect("Child node should exist");
+                game_copy.make_move(move_idx / BOARD_SIZE, move_idx % BOARD_SIZE);
+                current = &mut current.children[child_index].node;
             }
 
-            // Expansion + evaluation.
-            let value_leaf = if game_copy.is_game_over() {
+            // Expansion + evaluation
+            let leaf_value = if game_copy.is_game_over() {
                 self.get_terminal_value(game_copy.as_ref(), game_copy.current_player())
             } else {
-                let new_node = self.evaluate_node(game_copy.as_ref());
-                let value = new_node.total_value;
-                current.children = new_node.children;
-                current.is_terminal = new_node.is_terminal;
-                current.terminal_value = new_node.terminal_value;
+                let expanded = self.evaluate_node(game_copy.as_ref());
+                let value = expanded.total_value;
+                current.children = expanded.children;
+                current.is_terminal = expanded.is_terminal;
+                current.terminal_value = expanded.terminal_value;
                 value
             };
 
-            self.backup(&mut root, &path, value_leaf);
+            self.backup(&mut root, &path, leaf_value);
+
+            if self.should_stop_early(&root, simulation + 1, start) {
+                break;
+            }
         }
 
         self.get_move_probabilities(&root)
     }
 
-    /// Select best child using PUCT from the parent's perspective.
-    fn select_best_child(&self, node: &MctsNode, parent_visits: usize) -> usize {
-        let mut best_move = 0;
-        let mut best_score = f32::MIN;
-        let parent_sqrt = (parent_visits.max(1) as f32).sqrt();
+    fn search_typed<G>(&self, game: &G) -> Vec<(usize, usize, f32)>
+    where
+        G: Game + Clone,
+    {
+        let mut root = self.evaluate_node(game);
+        if root.children.is_empty() {
+            return Vec::new();
+        }
 
-        for (move_idx, child) in &node.children {
-            // Child q_value is from the child perspective (opponent),
-            // so negate it to score from parent perspective.
-            let q = -child.q_value();
-            let u =
-                self.config.c_puct * child.prior * parent_sqrt / (1.0 + child.visit_count as f32);
+        if self.config.skip_single_move_search && root.children.len() == 1 {
+            let idx = root.children[0].move_idx as usize;
+            return vec![(idx / BOARD_SIZE, idx % BOARD_SIZE, 1.0)];
+        }
+
+        if self.config.add_root_dirichlet_noise {
+            self.add_dirichlet_noise(&mut root);
+        }
+
+        let start = Instant::now();
+        let mut path: Vec<usize> = Vec::with_capacity(64);
+
+        for simulation in 0..self.config.num_simulations {
+            if self.config.enable_progress_log
+                && self.config.num_simulations >= 10
+                && simulation % (self.config.num_simulations / 10) == 0
+                && simulation > 0
+            {
+                println!(
+                    "    MCTS progress: {}/{} simulations ({}%)",
+                    simulation,
+                    self.config.num_simulations,
+                    (simulation * 100) / self.config.num_simulations
+                );
+            }
+
+            path.clear();
+            let mut game_copy = game.clone();
+
+            // Selection
+            let mut current = &mut root;
+            while !current.children.is_empty() {
+                let child_index = self.select_best_child_index(current);
+                let move_idx = current.children[child_index].move_idx as usize;
+                path.push(child_index);
+
+                game_copy.make_move(move_idx / BOARD_SIZE, move_idx % BOARD_SIZE);
+                current = &mut current.children[child_index].node;
+            }
+
+            // Expansion + evaluation
+            let leaf_value = if game_copy.is_game_over() {
+                self.get_terminal_value(&game_copy, game_copy.current_player())
+            } else {
+                let expanded = self.evaluate_node(&game_copy);
+                let value = expanded.total_value;
+                current.children = expanded.children;
+                current.is_terminal = expanded.is_terminal;
+                current.terminal_value = expanded.terminal_value;
+                value
+            };
+
+            self.backup(&mut root, &path, leaf_value);
+
+            if self.should_stop_early(&root, simulation + 1, start) {
+                break;
+            }
+        }
+
+        self.get_move_probabilities(&root)
+    }
+
+    /// Select best child using PUCT from parent perspective.
+    fn select_best_child_index(&self, node: &MctsNode) -> usize {
+        let mut best_index = 0usize;
+        let mut best_score = f32::MIN;
+        let parent_sqrt = (node.visit_count.max(1) as f32).sqrt();
+
+        for (index, child) in node.children.iter().enumerate() {
+            // child.q_value is from child perspective (opponent), so negate.
+            let q = -child.node.q_value();
+            let u = self.config.c_puct * child.node.prior * parent_sqrt
+                / (1.0 + child.node.visit_count as f32);
             let score = q + u;
 
             if score > best_score {
                 best_score = score;
-                best_move = *move_idx;
+                best_index = index;
             }
         }
 
-        best_move
+        best_index
     }
 
-    /// Evaluate a node using neural network and return expanded priors + leaf value.
-    fn evaluate_node(&self, game: &dyn Game) -> MctsNode {
+    /// Evaluate a node using neural network
+    fn evaluate_node<G: Game + ?Sized>(&self, game: &G) -> MctsNode {
         if game.is_game_over() {
             let value = self.get_terminal_value(game, game.current_player());
             return MctsNode::new_terminal(value);
@@ -233,17 +336,13 @@ impl<B: Backend> MctsSearch<B> {
         let (policy_probs, value) = if let Some(cached) = cached {
             (cached.policy_probs, cached.value)
         } else {
-            let input = game_to_tensor(game, &self.device);
+            let input = game_to_tensor_for(game, &self.device);
             let (policy_logits, value_tensor) = self.model.forward(input);
 
             let policy_probs = self.logits_to_probs(&policy_logits);
             let value_data = value_tensor.to_data();
             let value_slice = value_data.as_slice::<f32>().unwrap();
-            let value = if value_slice.is_empty() {
-                0.0
-            } else {
-                value_slice[0]
-            };
+            let value = value_slice.first().copied().unwrap_or(0.0);
 
             let mut cache = self.eval_cache.borrow_mut();
             if cache.len() >= self.config.eval_cache_size {
@@ -261,10 +360,12 @@ impl<B: Backend> MctsSearch<B> {
         };
 
         let valid_moves = self.get_valid_move_indices(game);
-        let mut children = HashMap::with_capacity(valid_moves.len());
+        let mut children = Vec::with_capacity(valid_moves.len());
         for move_idx in valid_moves {
-            let prior = policy_probs[move_idx];
-            children.insert(move_idx, MctsNode::new(prior));
+            children.push(MctsChild {
+                move_idx,
+                node: MctsNode::new(policy_probs[move_idx as usize]),
+            });
         }
 
         let mut node = MctsNode::new(0.0);
@@ -274,49 +375,98 @@ impl<B: Backend> MctsSearch<B> {
     }
 
     /// Backup values up the tree.
-    /// `value_leaf` is from the perspective of the leaf node current player.
-    fn backup(&self, root: &mut MctsNode, path: &[usize], value_leaf: f32) {
-        // Convert leaf value to root perspective.
+    fn backup(&self, root: &mut MctsNode, path: &[usize], leaf_value: f32) {
         let mut value = if path.len().is_multiple_of(2) {
-            value_leaf
+            leaf_value
         } else {
-            -value_leaf
+            -leaf_value
         };
 
         root.visit_count += 1;
         root.total_value += value;
 
         let mut current = root;
-        for move_idx in path {
-            // Move to child: perspective flips.
+        for &child_index in path {
             value = -value;
-            current = current
-                .children
-                .get_mut(move_idx)
-                .expect("Child node should exist");
+            current = &mut current.children[child_index].node;
             current.visit_count += 1;
             current.total_value += value;
         }
     }
 
-    /// Get move probabilities from visit counts
-    fn get_move_probabilities(&self, root: &MctsNode) -> Vec<(usize, usize, f32)> {
-        let total_visits: usize = root.children.values().map(|c| c.visit_count).sum();
-
-        if total_visits == 0 {
-            return Vec::new();
+    fn should_stop_early(&self, root: &MctsNode, simulations_done: usize, start: Instant) -> bool {
+        if simulations_done < self.config.min_simulations_before_stop {
+            return false;
         }
 
-        let mut moves: Vec<(usize, usize, f32)> = root
-            .children
-            .iter()
-            .map(|(move_idx, child)| {
-                let row = move_idx / BOARD_SIZE;
-                let col = move_idx % BOARD_SIZE;
-                let prob = child.visit_count as f32 / total_visits as f32;
-                (row, col, prob)
-            })
-            .collect();
+        if let Some(limit_ms) = self.config.max_search_time_ms
+            && start.elapsed().as_millis() >= u128::from(limit_ms)
+        {
+            return true;
+        }
+
+        if let Some(ratio) = self.config.early_stop_visit_ratio
+            && simulations_done.is_multiple_of(32)
+        {
+            let total_visits: usize = root.children.iter().map(|c| c.node.visit_count).sum();
+            if total_visits > 0 {
+                let best_visits = root
+                    .children
+                    .iter()
+                    .map(|c| c.node.visit_count)
+                    .max()
+                    .unwrap_or(0);
+                if best_visits as f32 / total_visits as f32 >= ratio {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Get move probabilities from visit counts
+    fn get_move_probabilities(&self, root: &MctsNode) -> Vec<(usize, usize, f32)> {
+        let total_visits: usize = root.children.iter().map(|c| c.node.visit_count).sum();
+
+        let mut moves: Vec<(usize, usize, f32)> = if total_visits > 0 {
+            root.children
+                .iter()
+                .map(|child| {
+                    let idx = child.move_idx as usize;
+                    (
+                        idx / BOARD_SIZE,
+                        idx % BOARD_SIZE,
+                        child.node.visit_count as f32 / total_visits as f32,
+                    )
+                })
+                .collect()
+        } else {
+            // Fallback to priors when no visit happened.
+            let prior_sum: f32 = root.children.iter().map(|c| c.node.prior.max(0.0)).sum();
+            if prior_sum > 0.0 {
+                root.children
+                    .iter()
+                    .map(|child| {
+                        let idx = child.move_idx as usize;
+                        (
+                            idx / BOARD_SIZE,
+                            idx % BOARD_SIZE,
+                            child.node.prior.max(0.0) / prior_sum,
+                        )
+                    })
+                    .collect()
+            } else {
+                let uniform = 1.0 / root.children.len() as f32;
+                root.children
+                    .iter()
+                    .map(|child| {
+                        let idx = child.move_idx as usize;
+                        (idx / BOARD_SIZE, idx % BOARD_SIZE, uniform)
+                    })
+                    .collect()
+            }
+        };
 
         if self.config.temperature != 1.0 && self.config.temperature > 0.0 {
             moves = self.apply_temperature(moves);
@@ -328,37 +478,33 @@ impl<B: Backend> MctsSearch<B> {
     /// Apply temperature to move probabilities
     fn apply_temperature(&self, moves: Vec<(usize, usize, f32)>) -> Vec<(usize, usize, f32)> {
         let max_prob = moves.iter().map(|(_, _, p)| *p).fold(0.0f32, f32::max);
-
         if max_prob <= 0.0 {
             return moves;
         }
 
         let temperature = self.config.temperature;
-        let mut new_moves: Vec<(usize, usize, f32)> = moves
+        let mut adjusted: Vec<(usize, usize, f32)> = moves
             .into_iter()
-            .map(|(r, c, p)| {
-                let adjusted = (p / max_prob).powf(1.0 / temperature) * max_prob;
-                (r, c, adjusted)
-            })
+            .map(|(r, c, p)| (r, c, (p / max_prob).powf(1.0 / temperature) * max_prob))
             .collect();
 
-        let sum: f32 = new_moves.iter().map(|(_, _, p)| p).sum();
+        let sum: f32 = adjusted.iter().map(|(_, _, p)| p).sum();
         if sum > 0.0 {
-            for (_, _, p) in &mut new_moves {
+            for (_, _, p) in &mut adjusted {
                 *p /= sum;
             }
         }
 
-        new_moves
+        adjusted
     }
 
     /// Get valid move indices
-    fn get_valid_move_indices(&self, game: &dyn Game) -> Vec<usize> {
+    fn get_valid_move_indices<G: Game + ?Sized>(&self, game: &G) -> Vec<u8> {
         let mut moves = Vec::new();
         for row in 0..BOARD_SIZE {
             for col in 0..BOARD_SIZE {
                 if game.is_valid_move(row, col) {
-                    moves.push(row * BOARD_SIZE + col);
+                    moves.push((row * BOARD_SIZE + col) as u8);
                 }
             }
         }
@@ -369,12 +515,11 @@ impl<B: Backend> MctsSearch<B> {
     fn logits_to_probs(&self, logits: &burn::tensor::Tensor<B, 2>) -> Vec<f32> {
         let probs = softmax(logits.clone(), 1);
         let probs_data = probs.to_data();
-        let data = probs_data.as_slice::<f32>().unwrap();
-        data.to_vec()
+        probs_data.as_slice::<f32>().unwrap().to_vec()
     }
 
     /// Get terminal value
-    fn get_terminal_value(&self, game: &dyn Game, perspective: Player) -> f32 {
+    fn get_terminal_value<G: Game + ?Sized>(&self, game: &G, perspective: Player) -> f32 {
         match game.winner() {
             Some(winner) if winner == perspective => 1.0,
             Some(_) => -1.0,
@@ -414,12 +559,12 @@ impl<B: Backend> MctsSearch<B> {
             *value /= sum;
         }
 
-        for (i, child) in root.children.values_mut().enumerate() {
-            child.prior = (1.0 - epsilon) * child.prior + epsilon * noise[i];
+        for (i, child) in root.children.iter_mut().enumerate() {
+            child.node.prior = (1.0 - epsilon) * child.node.prior + epsilon * noise[i];
         }
     }
 
-    fn board_key(game: &dyn Game) -> BoardKey {
+    fn board_key<G: Game + ?Sized>(game: &G) -> BoardKey {
         let mut black = 0u64;
         let mut white = 0u64;
 
@@ -474,7 +619,7 @@ pub fn select_move(move_probs: &[(usize, usize, f32)], temperature: f32) -> Opti
         return Some((r, c));
     }
 
-    let threshold: f32 = rng.random::<f32>() * total;
+    let threshold = rng.random::<f32>() * total;
     let mut cumulative = 0.0;
 
     for (row, col, prob) in move_probs {

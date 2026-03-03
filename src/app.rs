@@ -2,6 +2,9 @@ use crate::ai::{AiDifficulty, AiPlayer, GameMode, PlayerConfig, create_ai};
 use crate::game::{BOARD_SIZE, Cell, Game, Player};
 use eframe::egui;
 
+const AI_DELAY_MS_AI_VS_AI: u128 = 80;
+const AI_DELAY_MS_HUMAN_VS_AI: u128 = 0;
+
 pub struct GameApp {
     game: Box<dyn Game>,
     game_mode: GameMode,
@@ -152,10 +155,16 @@ impl eframe::App for GameApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle AI turns (only when not in settings)
         if !self.show_settings && self.is_ai_turn() && !self.thinking {
-            // Add a small delay for AI moves so it's visible
+            // Keep AI vs AI readable while minimizing delay for real matches.
+            let delay_ms = if self.game_mode == GameMode::AiVsAi {
+                AI_DELAY_MS_AI_VS_AI
+            } else {
+                AI_DELAY_MS_HUMAN_VS_AI
+            };
+
             let should_move = match self.last_ai_move_time {
                 None => true,
-                Some(last_time) => last_time.elapsed().as_millis() > 500,
+                Some(last_time) => last_time.elapsed().as_millis() >= delay_ms,
             };
 
             if should_move {

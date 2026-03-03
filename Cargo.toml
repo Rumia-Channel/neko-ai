@@ -11,3 +11,10 @@ wgpu = []
 burn = { version = "0.20.1", features = ["cpu", "webgpu", "vulkan", "ndarray", "autodiff", "store"] }
 eframe = "0.33.3"
 rand = "0.10.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
