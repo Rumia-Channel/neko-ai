@@ -1,6 +1,7 @@
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig, Relu, conv::Conv2d, conv::Conv2dConfig};
+use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use std::path::Path;
@@ -193,6 +194,30 @@ impl<B: Backend> AlphaZeroModel<B> {
 
     pub fn num_moves(&self) -> usize {
         self.num_moves
+    }
+
+    /// Load a trained model from a safetensors file.
+    /// Returns None if the file does not exist or loading fails.
+    pub fn load_trained(
+        config: &AlphaZeroModelConfig,
+        path: &str,
+        device: &B::Device,
+    ) -> Option<Self> {
+        let full_path = format!("{}.mpk", path);
+        if !Path::new(&full_path).exists() {
+            return None;
+        }
+
+        let model = Self::new(config, device);
+        let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
+
+        match model.load_file(path, &recorder, device) {
+            Ok(loaded) => Some(loaded),
+            Err(e) => {
+                eprintln!("Failed to load model from {}: {:?}", path, e);
+                None
+            }
+        }
     }
 }
 

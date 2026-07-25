@@ -9,13 +9,14 @@ pub use honrou::HonrouAi;
 pub use monte_carlo::MonteCarloAi;
 pub use restrictive::RestrictiveAi;
 
-/// Path to the trained model file (safetensors format)
-#[allow(dead_code)]
-pub const DEFAULT_MODEL_PATH: &str = "checkpoints/best_model";
+use alphazero::player::AlphaZeroPlayer;
+use alphazero::{AlphaZeroModel, AlphaZeroModelConfig, MctsConfig, MctsSearch};
 
-// Note: Model serialization requires additional burn configuration.
-// The save/load functionality is prepared but may need API adjustments
-// based on your specific burn version and backend.
+/// Path to the trained model file for Hard difficulty
+pub const HARD_MODEL_PATH: &str = "checkpoints/best_model";
+
+/// Path to the trained artistic model file for Honrou difficulty
+pub const HONROU_MODEL_PATH: &str = "checkpoints/honrou_model";
 
 /// AIプレイヤーのインターフェース
 /// ゲーム状態を受け取り、最適な手（row, col）を返す
@@ -41,6 +42,7 @@ pub struct RandomAi {
 }
 
 impl RandomAi {
+    #[allow(dead_code)]
     pub fn new(player: Player) -> Self {
         Self { player }
     }
@@ -104,8 +106,36 @@ pub fn create_ai(difficulty: AiDifficulty, player: Player) -> Box<dyn AiPlayer> 
             // 5手先で相手の選択肢を最小化する戦略
             Box::new(RestrictiveAi::new(player))
         }
-        AiDifficulty::Hard => Box::new(RandomAi::new(player)), // TODO: Minimax AIを実装
-        AiDifficulty::Honrou => Box::new(HonrouAi::new(player)),
+        AiDifficulty::Hard => create_alphazero_ai(player, HARD_MODEL_PATH),
+        AiDifficulty::Honrou => create_alphazero_ai(player, HONROU_MODEL_PATH),
+    }
+}
+
+/// AlphaZero AIを生成する。モデルファイルが存在すれば読み込み、なければフォールバック。
+fn create_alphazero_ai(player: Player, model_path: &str) -> Box<dyn AiPlayer> {
+    use burn::backend::ndarray::NdArray;
+
+    type InferBackend = NdArray;
+
+    let device = burn::backend::ndarray::NdArrayDevice::default();
+    let config = AlphaZeroModelConfig::new();
+
+    if let Some(model) = AlphaZeroModel::<InferBackend>::load_trained(&config, model_path, &device)
+    {
+        let mcts_config = MctsConfig {
+            num_simulations: 800,
+            max_search_time_ms: Some(2000),
+            ..Default::default()
+        };
+        let mcts = MctsSearch::new(mcts_config, model, device);
+        Box::new(AlphaZeroPlayer::new(player, mcts))
+    } else {
+        // モデルファイルがない場合はフォールバック
+        eprintln!(
+            "AlphaZero model not found at '{}', falling back to HonrouAi",
+            model_path
+        );
+        Box::new(HonrouAi::new(player))
     }
 }
 

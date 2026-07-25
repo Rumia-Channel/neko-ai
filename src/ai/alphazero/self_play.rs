@@ -1,17 +1,31 @@
 //! Self-play for AlphaZero training data generation
 //!
-//! Generates training examples by having the neural network play against itself.
+//! Generates training examples by having the neural network play against itself
+//! and against conventional AI opponents (Easy/Medium/SlightlyHard).
 
+use crate::ai::alphazero::artistic::{ArtisticPattern, evaluate_artistic_reward};
 use crate::ai::alphazero::mcts::{MctsConfig, MctsSearch, select_move};
 use crate::ai::alphazero::tensor_utils::game_to_tensor;
+use crate::ai::{AiDifficulty, AiPlayer, create_ai};
 use crate::game::{BOARD_SIZE, Game, OthelloGame, Player};
 use burn::tensor::backend::Backend;
+
+/// 報酬モード: 通常 (勝敗) または芸術 (翻弄用)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RewardMode {
+    /// 通常の勝敗報酬 (+1 / 0 / -1)
+    Standard,
+    /// 芸術的報酬 (最終局面の美しさを評価)
+    Artistic,
+}
 
 /// Configuration for self-play
 #[derive(Debug, Clone, Copy)]
 pub struct SelfPlayConfig {
-    /// Number of games to play (default: 25000 in full AlphaZero)
+    /// Number of self-play games
     pub num_games: usize,
+    /// Number of games against conventional AI opponents (per difficulty)
+    pub num_mixed_games: usize,
     /// Temperature for early game exploration (default: 1.0)
     pub temperature: f32,
     /// Number of moves before applying temperature decay (default: 30)
@@ -26,12 +40,15 @@ pub struct SelfPlayConfig {
     pub augment_symmetry: bool,
     /// Safety guard for infinite loops.
     pub max_moves_per_game: usize,
+    /// Reward mode (standard or artistic)
+    pub reward_mode: RewardMode,
 }
 
 impl Default for SelfPlayConfig {
     fn default() -> Self {
         Self {
             num_games: 100,
+            num_mixed_games: 20,
             temperature: 1.0,
             temp_threshold: 30,
             temp_after_threshold: 0.0,
@@ -39,6 +56,7 @@ impl Default for SelfPlayConfig {
             mcts_config: MctsConfig::default(),
             augment_symmetry: true,
             max_moves_per_game: 120,
+            reward_mode: RewardMode::Standard,
         }
     }
 }
@@ -70,12 +88,17 @@ impl<B: Backend> SelfPlayEngine<B> {
         }
     }
 
-    /// Generate training data through self-play
+    /// Generate training data through self-play and mixed opponent games
     pub fn generate_data(&self) -> Vec<TrainingExample> {
         let mut all_examples = Vec::new();
         let start_time = std::time::Instant::now();
+        let mut patterns: Vec<ArtisticPattern> = Vec::new();
 
-        println!("Starting self-play for {} games...", self.config.num_games);
+        // Phase 1: Self-play games
+        println!(
+            "Starting self-play for {} games (reward: {:?})...",
+            self.config.num_games, self.config.reward_mode
+        );
 
         for game_idx in 0..self.config.num_games {
             if game_idx % self.config.checkpoint_interval == 0 {
@@ -92,29 +115,72 @@ impl<B: Backend> SelfPlayEngine<B> {
             }
 
             let game_start = std::time::Instant::now();
-            let examples = self.play_one_game();
+            let (examples, pattern) = self.play_one_game();
             let game_duration = game_start.elapsed();
 
             if game_idx < 5 || game_idx % 10 == 0 {
                 println!("  Game {} completed in {:?}", game_idx + 1, game_duration);
             }
 
+            if let Some(p) = pattern {
+                patterns.push(p);
+            }
             all_examples.extend(examples);
+        }
+
+        // Phase 2: Mixed opponent games (vs Easy, Medium, SlightlyHard)
+        if self.config.num_mixed_games > 0 {
+            println!(
+                "\nStarting mixed opponent games ({} per difficulty)...",
+                self.config.num_mixed_games
+            );
+
+            let difficulties = [
+                AiDifficulty::Easy,
+                AiDifficulty::Medium,
+                AiDifficulty::SlightlyHard,
+            ];
+
+            for &difficulty in &difficulties {
+                println!(
+                    "  Playing {} games vs {}...",
+                    self.config.num_mixed_games,
+                    difficulty.as_str()
+                );
+
+                for game_idx in 0..self.config.num_mixed_games {
+                    let (examples, pattern) = self.play_vs_conventional_ai(difficulty);
+                    if let Some(p) = pattern {
+                        patterns.push(p);
+                    }
+                    all_examples.extend(examples);
+
+                    if game_idx % 10 == 0 && game_idx > 0 {
+                        println!("    {}/{} done", game_idx, self.config.num_mixed_games);
+                    }
+                }
+            }
         }
 
         let total_time = start_time.elapsed();
         println!(
-            "Generated {} training examples from {} games in {:?}",
+            "\nGenerated {} training examples from {} self-play + {} mixed games in {:?}",
             all_examples.len(),
             self.config.num_games,
+            self.config.num_mixed_games * 3,
             total_time
         );
+
+        // Print artistic pattern statistics if in artistic mode
+        if self.config.reward_mode == RewardMode::Artistic && !patterns.is_empty() {
+            crate::ai::alphazero::artistic::print_pattern_stats(&patterns);
+        }
 
         all_examples
     }
 
-    /// Play a single game and return training examples
-    fn play_one_game(&self) -> Vec<TrainingExample> {
+    /// Play a single self-play game and return training examples + detected pattern
+    fn play_one_game(&self) -> (Vec<TrainingExample>, Option<ArtisticPattern>) {
         let mut game = OthelloGame::default();
         let mut history: Vec<(Vec<f32>, Vec<f32>, Player)> = Vec::new();
         let mut move_count = 0usize;
@@ -150,35 +216,191 @@ impl<B: Backend> SelfPlayEngine<B> {
                 game.make_move(row, col);
                 move_count += 1;
             } else {
-                // Should be rare: fallback to pass for safety.
                 game.pass_turn();
             }
         }
 
-        let winner = game.winner();
-        let final_value = |player: Player| -> f32 {
-            match winner {
-                Some(w) if w == player => 1.0,
-                Some(_) => -1.0,
-                None => 0.0,
-            }
+        let examples = self.build_examples_from_history(&game, &history);
+        let pattern = if self.config.reward_mode == RewardMode::Artistic {
+            Some(self.detect_final_pattern(&game))
+        } else {
+            None
         };
 
+        (examples, pattern)
+    }
+
+    /// Play a game against a conventional AI opponent.
+    /// AlphaZero plays as Black (first player), opponent as White.
+    fn play_vs_conventional_ai(
+        &self,
+        difficulty: AiDifficulty,
+    ) -> (Vec<TrainingExample>, Option<ArtisticPattern>) {
+        let mut game = OthelloGame::default();
+        let mut history: Vec<(Vec<f32>, Vec<f32>, Player)> = Vec::new();
+        let mut move_count = 0usize;
+
+        let opponent: Box<dyn AiPlayer> = create_ai(difficulty, Player::White);
+
+        while !game.is_game_over() && move_count < self.config.max_moves_per_game {
+            let valid_moves = self.valid_moves(&game);
+
+            if valid_moves.is_empty() {
+                game.pass_turn();
+                continue;
+            }
+
+            if game.current_player() == Player::Black {
+                // AlphaZero's turn (Black)
+                let temperature = if move_count < self.config.temp_threshold {
+                    self.config.temperature
+                } else {
+                    self.config.temp_after_threshold
+                };
+
+                let board_tensor = self.board_to_tensor(&game);
+
+                let move_probs = if valid_moves.len() == 1 {
+                    let (row, col) = valid_moves[0];
+                    vec![(row, col, 1.0)]
+                } else {
+                    self.mcts.search_othello(&game)
+                };
+                let target_policy = self.move_probs_to_policy(&move_probs);
+
+                history.push((board_tensor, target_policy, Player::Black));
+
+                if let Some((row, col)) = select_move(&move_probs, temperature) {
+                    game.make_move(row, col);
+                    move_count += 1;
+                } else {
+                    game.pass_turn();
+                }
+            } else {
+                // Opponent's turn (White)
+                if let Some((row, col)) = opponent.choose_move(&game) {
+                    game.make_move(row, col);
+                    move_count += 1;
+                } else {
+                    game.pass_turn();
+                }
+            }
+        }
+
+        // Only collect training data for AlphaZero's moves (Black)
+        let examples = self.build_examples_from_history(&game, &history);
+        let pattern = if self.config.reward_mode == RewardMode::Artistic {
+            Some(self.detect_final_pattern(&game))
+        } else {
+            None
+        };
+
+        (examples, pattern)
+    }
+
+    /// Build training examples from move history, applying the configured reward mode
+    fn build_examples_from_history(
+        &self,
+        game: &OthelloGame,
+        history: &[(Vec<f32>, Vec<f32>, Player)],
+    ) -> Vec<TrainingExample> {
         let mut examples: Vec<TrainingExample> = Vec::with_capacity(history.len());
+
         for (board_tensor, target_policy, player) in history {
-            let value = final_value(player);
+            let value = match self.config.reward_mode {
+                RewardMode::Standard => {
+                    let winner = game.winner();
+                    match winner {
+                        Some(w) if w == *player => 1.0,
+                        Some(_) => -1.0,
+                        None => 0.0,
+                    }
+                }
+                RewardMode::Artistic => evaluate_artistic_reward(game, *player),
+            };
+
             if self.config.augment_symmetry {
-                examples.extend(self.augment_by_symmetry(&board_tensor, &target_policy, value));
+                examples.extend(self.augment_by_symmetry(board_tensor, target_policy, value));
             } else {
                 examples.push(TrainingExample {
-                    board_tensor,
-                    target_policy,
+                    board_tensor: board_tensor.clone(),
+                    target_policy: target_policy.clone(),
                     value,
                 });
             }
         }
 
         examples
+    }
+
+    /// Detect the artistic pattern in the final game state
+    fn detect_final_pattern(&self, game: &OthelloGame) -> ArtisticPattern {
+        use crate::ai::alphazero::artistic::ArtisticPattern;
+
+        let my_count = game.black_count();
+        let opp_count = game.white_count();
+
+        if my_count == 32 && opp_count == 32 {
+            return ArtisticPattern::PerfectDraw;
+        }
+
+        // AlphaZero plays Black in mixed games; check corner sacrifice
+        let corners = [(0, 0), (0, 7), (7, 0), (7, 7)];
+        let opp_has_all_corners = corners
+            .iter()
+            .all(|&(r, c)| game.board()[r][c] == crate::game::Cell::White);
+        if my_count >= 58 && opp_count <= 6 && opp_has_all_corners {
+            return ArtisticPattern::CornerSacrifice;
+        }
+
+        let coverage = self.count_block_coverage(game);
+        if coverage >= 0.75 {
+            return ArtisticPattern::BlockTiling;
+        }
+
+        match game.winner() {
+            Some(Player::Black) => {
+                if my_count >= 50 {
+                    ArtisticPattern::DominantWin
+                } else {
+                    ArtisticPattern::StandardWin
+                }
+            }
+            Some(Player::White) => ArtisticPattern::Loss,
+            None => ArtisticPattern::StandardDraw,
+        }
+    }
+
+    /// Count 2x2 block coverage for pattern detection
+    fn count_block_coverage(&self, game: &OthelloGame) -> f32 {
+        let board = game.board();
+        let mut covered = vec![vec![false; BOARD_SIZE]; BOARD_SIZE];
+
+        for row in (0..BOARD_SIZE - 1).step_by(2) {
+            for col in (0..BOARD_SIZE - 1).step_by(2) {
+                let cell = board[row][col];
+                if cell == crate::game::Cell::Empty {
+                    continue;
+                }
+                if board[row][col + 1] == cell
+                    && board[row + 1][col] == cell
+                    && board[row + 1][col + 1] == cell
+                {
+                    covered[row][col] = true;
+                    covered[row][col + 1] = true;
+                    covered[row + 1][col] = true;
+                    covered[row + 1][col + 1] = true;
+                }
+            }
+        }
+
+        let covered_count = covered
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|&&c| c)
+            .count();
+
+        covered_count as f32 / (BOARD_SIZE * BOARD_SIZE) as f32
     }
 
     fn valid_moves(&self, game: &OthelloGame) -> Vec<(usize, usize)> {

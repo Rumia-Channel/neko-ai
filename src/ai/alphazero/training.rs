@@ -35,6 +35,8 @@ pub struct TrainingConfig {
     pub checkpoint_dir: Option<String>,
     /// Save checkpoint every N epochs
     pub save_every: usize,
+    /// Model name for saving (e.g., "best_model" or "honrou_model")
+    pub model_name: String,
 }
 
 impl Default for TrainingConfig {
@@ -49,6 +51,7 @@ impl Default for TrainingConfig {
             validation_split: 0.1,
             checkpoint_dir: Some("checkpoints".to_string()),
             save_every: 10,
+            model_name: "best_model".to_string(),
         }
     }
 }
@@ -133,7 +136,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                 best_val_loss = val_loss;
                 if let Some(ref checkpoint_dir) = self.config.checkpoint_dir {
                     println!("New best validation loss: {:.6}", best_val_loss);
-                    self.save_model_stub(checkpoint_dir, "best_model");
+                    self.save_model_stub(checkpoint_dir, &self.config.model_name);
                 }
             }
 
