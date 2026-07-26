@@ -11,6 +11,7 @@ use crate::ai::alphazero::tensor_utils::game_to_tensor_for;
 use crate::game::{BOARD_SIZE, Cell, Game, OthelloGame, Player};
 use burn::tensor::activation::softmax;
 use burn::tensor::backend::Backend;
+use burn::tensor::{Tensor, TensorData};
 use rand::RngExt;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -249,56 +250,222 @@ impl<B: Backend> MctsSearch<B> {
         }
 
         let start = Instant::now();
-        let mut path: Vec<usize> = Vec::with_capacity(64);
+        let batch_size = 8usize;
+        let mut simulation = 0usize;
 
-        for simulation in 0..self.config.num_simulations {
-            if self.config.enable_progress_log
-                && self.config.num_simulations >= 10
-                && simulation % (self.config.num_simulations / 10) == 0
-                && simulation > 0
-            {
-                println!(
-                    "    MCTS progress: {}/{} simulations ({}%)",
-                    simulation,
-                    self.config.num_simulations,
-                    (simulation * 100) / self.config.num_simulations
-                );
+        while simulation < self.config.num_simulations {
+            let batch_end = (simulation + batch_size).min(self.config.num_simulations);
+            let current_batch = batch_end - simulation;
+
+            // Phase 1: Selection — collect leaves (read-only tree traversal)
+            let mut leaves: Vec<(Vec<usize>, G)> = Vec::with_capacity(current_batch);
+            for _ in 0..current_batch {
+                let (path, leaf_game) = self.select_leaf_typed(&root, game);
+                leaves.push((path, leaf_game));
             }
 
-            path.clear();
-            let mut game_copy = game.clone();
+            // Phase 2: Batch evaluate non-terminal leaves
+            let values = self.batch_evaluate_leaves(&leaves);
 
-            // Selection
-            let mut current = &mut root;
-            while !current.children.is_empty() {
-                let child_index = self.select_best_child_index(current);
-                let move_idx = current.children[child_index].move_idx as usize;
-                path.push(child_index);
-
-                game_copy.make_move(move_idx / BOARD_SIZE, move_idx % BOARD_SIZE);
-                current = &mut current.children[child_index].node;
+            // Phase 3: Expand and backpropagate
+            for (i, (path, leaf_game)) in leaves.into_iter().enumerate() {
+                let value = values[i];
+                self.expand_and_backup_typed(&mut root, &path, &leaf_game, value);
             }
 
-            // Expansion + evaluation
-            let leaf_value = if game_copy.is_game_over() {
-                self.get_terminal_value(&game_copy, game_copy.current_player())
-            } else {
-                let expanded = self.evaluate_node(&game_copy);
-                let value = expanded.total_value;
-                current.children = expanded.children;
-                current.is_terminal = expanded.is_terminal;
-                current.terminal_value = expanded.terminal_value;
-                value
-            };
+            simulation = batch_end;
 
-            self.backup(&mut root, &path, leaf_value);
-
-            if self.should_stop_early(&root, simulation + 1, start) {
+            if self.should_stop_early(&root, simulation, start) {
                 break;
             }
         }
 
         self.get_move_probabilities(&root)
+    }
+
+    /// Select a leaf node by traversing the tree (read-only).
+    /// Returns the path (child indices) and the game state at the leaf.
+    fn select_leaf_typed<G>(&self, root: &MctsNode, game: &G) -> (Vec<usize>, G)
+    where
+        G: Game + Clone,
+    {
+        let mut path: Vec<usize> = Vec::with_capacity(64);
+        let mut game_copy = game.clone();
+        let mut current = root;
+
+        while !current.children.is_empty() {
+            let child_index = self.select_best_child_index(current);
+            let move_idx = current.children[child_index].move_idx as usize;
+            path.push(child_index);
+            game_copy.make_move(move_idx / BOARD_SIZE, move_idx % BOARD_SIZE);
+            current = &current.children[child_index].node;
+        }
+
+        (path, game_copy)
+    }
+
+    /// Batch evaluate multiple leaf positions.
+    /// Returns a value for each leaf (terminal leaves get exact values, others get NN eval).
+    fn batch_evaluate_leaves<G>(&self, leaves: &[(Vec<usize>, G)]) -> Vec<f32>
+    where
+        G: Game + Clone,
+    {
+        let mut values = vec![0.0f32; leaves.len()];
+        let mut nn_indices: Vec<usize> = Vec::new();
+        let mut nn_games: Vec<&G> = Vec::new();
+
+        // Separate terminal leaves from those needing NN evaluation
+        for (i, (_, leaf_game)) in leaves.iter().enumerate() {
+            if leaf_game.is_game_over() {
+                values[i] = self.get_terminal_value(leaf_game, leaf_game.current_player());
+            } else {
+                // Check cache first
+                let key = Self::board_key(leaf_game);
+                let cache = self.eval_cache.borrow();
+                if let Some(cached) = cache.get(&key) {
+                    values[i] = cached.value;
+                    drop(cache);
+                } else {
+                    drop(cache);
+                    nn_indices.push(i);
+                    nn_games.push(leaf_game);
+                }
+            }
+        }
+
+        // Batch evaluate all uncached positions in one forward pass
+        if !nn_games.is_empty() {
+            let batch_results = self.batch_evaluate_games(&nn_games);
+
+            for (batch_idx, &leaf_idx) in nn_indices.iter().enumerate() {
+                let (value, policy) = &batch_results[batch_idx];
+                values[leaf_idx] = *value;
+
+                // Cache the result
+                let (_, leaf_game) = &leaves[leaf_idx];
+                let key = Self::board_key(leaf_game);
+                let mut cache = self.eval_cache.borrow_mut();
+                if cache.len() >= self.config.eval_cache_size {
+                    cache.clear();
+                }
+                cache.insert(
+                    key,
+                    CachedEvaluation {
+                        value: *value,
+                        policy_probs: policy.clone(),
+                    },
+                );
+            }
+        }
+
+        values
+    }
+
+    /// Evaluate multiple game positions in a single batched forward pass.
+    fn batch_evaluate_games<G: Game + ?Sized>(&self, games: &[&G]) -> Vec<(f32, Vec<f32>)> {
+        let batch_size = games.len();
+
+        // Build flat tensor data for all games: [batch, 3, 8, 8]
+        let channels = 3 * BOARD_SIZE * BOARD_SIZE;
+        let mut flat = Vec::with_capacity(batch_size * channels);
+
+        for game in games {
+            let board = game.board();
+            let current = game.current_player();
+
+            for row in board.iter() {
+                for &cell in row.iter() {
+                    // Channel 0: own stones
+                    let own = match cell {
+                        Cell::Black if current == Player::Black => 1.0f32,
+                        Cell::White if current == Player::White => 1.0f32,
+                        _ => 0.0f32,
+                    };
+                    flat.push(own);
+                }
+            }
+            for row in board.iter() {
+                for &cell in row.iter() {
+                    // Channel 1: opponent stones
+                    let opp = match cell {
+                        Cell::Black if current == Player::White => 1.0f32,
+                        Cell::White if current == Player::Black => 1.0f32,
+                        _ => 0.0f32,
+                    };
+                    flat.push(opp);
+                }
+            }
+            for row in board.iter() {
+                for &cell in row.iter() {
+                    // Channel 2: empty
+                    let empty = if cell == Cell::Empty { 1.0f32 } else { 0.0f32 };
+                    flat.push(empty);
+                }
+            }
+        }
+
+        let input = Tensor::from_data(
+            TensorData::new(flat, [batch_size, 3, BOARD_SIZE, BOARD_SIZE]),
+            &self.device,
+        );
+
+        let (policy_logits, value_tensor) = self.model.forward(input);
+        let policy_probs = softmax(policy_logits, 1);
+
+        let value_data = value_tensor.to_data();
+        let policy_data = policy_probs.to_data();
+
+        let value_slice = value_data.as_slice::<f32>().unwrap();
+        let policy_slice = policy_data.as_slice::<f32>().unwrap();
+
+        let num_moves = BOARD_SIZE * BOARD_SIZE;
+        let mut results = Vec::with_capacity(batch_size);
+
+        for (i, &value) in value_slice.iter().enumerate().take(batch_size) {
+            let policy_start = i * num_moves;
+            let policy: Vec<f32> = policy_slice[policy_start..policy_start + num_moves].to_vec();
+            results.push((value, policy));
+        }
+
+        results
+    }
+
+    /// Expand a leaf node and backpropagate the value.
+    fn expand_and_backup_typed<G>(
+        &self,
+        root: &mut MctsNode,
+        path: &[usize],
+        leaf_game: &G,
+        leaf_value: f32,
+    ) where
+        G: Game + Clone,
+    {
+        // Expand the leaf (if not terminal and not yet expanded)
+        if !leaf_game.is_game_over() {
+            let mut current = &mut *root;
+            for &child_index in path {
+                current = &mut current.children[child_index].node;
+            }
+
+            if current.children.is_empty() {
+                let key = Self::board_key(leaf_game);
+                let cache = self.eval_cache.borrow();
+                if let Some(cached) = cache.get(&key) {
+                    let valid_moves = self.get_valid_move_indices(leaf_game);
+                    current.children = valid_moves
+                        .iter()
+                        .map(|&move_idx| MctsChild {
+                            move_idx,
+                            node: MctsNode::new(cached.policy_probs[move_idx as usize]),
+                        })
+                        .collect();
+                }
+                drop(cache);
+            }
+        }
+
+        // Backpropagate
+        self.backup(root, path, leaf_value);
     }
 
     /// Select best child using PUCT from parent perspective.

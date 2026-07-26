@@ -52,9 +52,7 @@ fn main() {
     let profile = TrainingProfile::from_args(&args);
 
     let is_gpu = args.iter().any(|arg| arg.ends_with("-gpu"));
-    let is_honrou = args
-        .iter()
-        .any(|arg| arg.contains("honrou"));
+    let is_honrou = args.iter().any(|arg| arg.contains("honrou"));
     let is_training = args.iter().any(|arg| arg.starts_with("--training"));
 
     if is_training && is_honrou && is_gpu {
@@ -296,21 +294,25 @@ fn run_training_mode_gpu(profile: TrainingProfile) {
 
     #[cfg(feature = "wgpu")]
     {
+        use burn::backend::ndarray::NdArrayDevice;
         use burn::backend::wgpu::WgpuDevice;
 
-        type InferBackend = burn::backend::wgpu::Wgpu;
-        type TrainBackend = burn::backend::Autodiff<InferBackend>;
+        // Self-play uses CPU (NdArray) for inference — GPU batch_size=1 is slower
+        // due to CPU↔GPU transfer overhead per simulation.
+        type InferBackend = burn::backend::ndarray::NdArray;
+        type TrainBackend = burn::backend::Autodiff<burn::backend::wgpu::Wgpu>;
 
-        // Setup GPU device
-        let device = WgpuDevice::default();
-        println!("Using device: GPU (WGPU)");
+        let cpu_device = NdArrayDevice::default();
+        let gpu_device = WgpuDevice::default();
+        println!("Self-play device: CPU (NdArray)");
+        println!("Training device:  GPU (WGPU)");
 
         let model_config = AlphaZeroModelConfig::new();
         println!("Initializing AlphaZero model...");
         println!("  - Residual blocks: {}", model_config.num_res_blocks);
         println!("  - Filters: {}", model_config.num_filters);
 
-        let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &device);
+        let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &cpu_device);
         let self_play_config = build_self_play_config(profile, true);
         println!("\nSelf-play configuration:");
         println!("  - Games: {}", self_play_config.num_games);
@@ -323,22 +325,18 @@ fn run_training_mode_gpu(profile: TrainingProfile) {
             self_play_config.augment_symmetry
         );
 
-        println!("\nInitializing self-play engine with GPU...");
-        let mcts = MctsSearch::new(
-            self_play_config.mcts_config,
-            self_play_model,
-            device.clone(),
-        );
-        let self_play = SelfPlayEngine::new(self_play_config, mcts, device.clone());
+        println!("\nInitializing self-play engine (CPU inference)...");
+        let mcts = MctsSearch::new(self_play_config.mcts_config, self_play_model, cpu_device);
+        let self_play = SelfPlayEngine::new(self_play_config, mcts, NdArrayDevice::default());
 
         println!("\n--- Starting Self-Play ---");
         let training_data = self_play.generate_data();
 
         println!("\n--- Starting Training on GPU ---");
-        let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &device);
+        let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &gpu_device);
         let training_config = build_training_config(profile, true);
 
-        let mut trainer = Trainer::new(training_config, training_model, device);
+        let mut trainer = Trainer::new(training_config, training_model, gpu_device);
         trainer.train(&training_data);
 
         println!("\n========================================");
@@ -448,20 +446,23 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
 
     #[cfg(feature = "wgpu")]
     {
+        use burn::backend::ndarray::NdArrayDevice;
         use burn::backend::wgpu::WgpuDevice;
 
-        type InferBackend = burn::backend::wgpu::Wgpu;
-        type TrainBackend = burn::backend::Autodiff<InferBackend>;
+        type InferBackend = burn::backend::ndarray::NdArray;
+        type TrainBackend = burn::backend::Autodiff<burn::backend::wgpu::Wgpu>;
 
-        let device = WgpuDevice::default();
-        println!("Using device: GPU (WGPU)");
+        let cpu_device = NdArrayDevice::default();
+        let gpu_device = WgpuDevice::default();
+        println!("Self-play device: CPU (NdArray)");
+        println!("Training device:  GPU (WGPU)");
 
         let model_config = AlphaZeroModelConfig::new();
         println!("Initializing AlphaZero model (artistic)...");
         println!("  - Residual blocks: {}", model_config.num_res_blocks);
         println!("  - Filters: {}", model_config.num_filters);
 
-        let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &device);
+        let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &cpu_device);
 
         let mut self_play_config = build_self_play_config(profile, true);
         self_play_config.reward_mode = RewardMode::Artistic;
@@ -492,26 +493,22 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
             self_play_config.augment_symmetry
         );
 
-        println!("\nInitializing self-play engine with GPU (artistic)...");
-        let mcts = MctsSearch::new(
-            self_play_config.mcts_config,
-            self_play_model,
-            device.clone(),
-        );
-        let self_play = SelfPlayEngine::new(self_play_config, mcts, device.clone());
+        println!("\nInitializing self-play engine (CPU inference, artistic)...");
+        let mcts = MctsSearch::new(self_play_config.mcts_config, self_play_model, cpu_device);
+        let self_play = SelfPlayEngine::new(self_play_config, mcts, NdArrayDevice::default());
 
         println!("\n--- Starting Self-Play (Artistic) ---");
         let training_data = self_play.generate_data();
 
         println!("\n--- Starting Training on GPU (Artistic) ---");
-        let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &device);
+        let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &gpu_device);
 
         let mut training_config = build_training_config(profile, true);
         training_config.checkpoint_dir = Some("checkpoints".to_string());
         training_config.model_name = "honrou_model".to_string();
         training_config.learning_rate *= 0.8;
 
-        let mut trainer = Trainer::new(training_config, training_model, device);
+        let mut trainer = Trainer::new(training_config, training_model, gpu_device);
         trainer.train(&training_data);
 
         println!("\n========================================");

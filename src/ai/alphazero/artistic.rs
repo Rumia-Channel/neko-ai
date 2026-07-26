@@ -201,14 +201,12 @@ mod tests {
     #[test]
     fn test_perfect_draw_detection() {
         // 32:32 の盤面を直接構築
-        let mut game = OthelloGame::default();
+        let game = OthelloGame::default();
         // 初期状態は 2:2 なので、手動で盤面を埋める
         // (テスト用に game_over を直接セットできないため、パターン検出ロジックのみ検証)
-        let board = game.board();
         // 初期状態では PerfectDraw にならない
         let reward = evaluate_artistic_reward(&game, Player::Black);
         assert!(reward < 1.0);
-        let _ = board;
     }
 
     #[test]
