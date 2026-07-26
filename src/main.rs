@@ -50,21 +50,20 @@ impl TrainingProfile {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let profile = TrainingProfile::from_args(&args);
-    let is_training_mode = args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--training" | "--training-fast" | "--training-balanced" | "--training-high"
-        )
-    });
-    let is_honrou_training = args
-        .iter()
-        .any(|arg| arg == "--training-honrou" || arg == "--honrou");
 
-    if args.iter().any(|arg| arg == "--training-gpu") {
-        run_training_mode_gpu(profile);
-    } else if is_honrou_training {
+    let is_gpu = args.iter().any(|arg| arg.ends_with("-gpu"));
+    let is_honrou = args
+        .iter()
+        .any(|arg| arg.contains("honrou"));
+    let is_training = args.iter().any(|arg| arg.starts_with("--training"));
+
+    if is_training && is_honrou && is_gpu {
+        run_training_mode_honrou_gpu(profile);
+    } else if is_training && is_honrou {
         run_training_mode_honrou(profile);
-    } else if is_training_mode {
+    } else if is_training && is_gpu {
+        run_training_mode_gpu(profile);
+    } else if is_training {
         run_training_mode(profile);
     } else if let Err(e) = run_gui_mode() {
         eprintln!("Error running GUI: {}", e);
@@ -437,4 +436,94 @@ fn run_training_mode_honrou(profile: TrainingProfile) {
     println!("  翻弄 Training Complete!");
     println!("  Artistic patterns learned.");
     println!("========================================");
+}
+
+#[allow(unexpected_cfgs)]
+fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
+    println!("========================================");
+    println!("  AlphaZero 翻弄 Training Mode (GPU)");
+    println!("  Artistic Reward: 芸術的報酬");
+    println!("========================================\n");
+    println!("Training profile: {}\n", profile.as_str());
+
+    #[cfg(feature = "wgpu")]
+    {
+        use burn::backend::wgpu::WgpuDevice;
+
+        type InferBackend = burn::backend::wgpu::Wgpu;
+        type TrainBackend = burn::backend::Autodiff<InferBackend>;
+
+        let device = WgpuDevice::default();
+        println!("Using device: GPU (WGPU)");
+
+        let model_config = AlphaZeroModelConfig::new();
+        println!("Initializing AlphaZero model (artistic)...");
+        println!("  - Residual blocks: {}", model_config.num_res_blocks);
+        println!("  - Filters: {}", model_config.num_filters);
+
+        let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &device);
+
+        let mut self_play_config = build_self_play_config(profile, true);
+        self_play_config.reward_mode = RewardMode::Artistic;
+        self_play_config.num_games = match profile {
+            TrainingProfile::Fast => 80,
+            TrainingProfile::Balanced => 300,
+            TrainingProfile::HighQuality => 800,
+        };
+        self_play_config.num_mixed_games = match profile {
+            TrainingProfile::Fast => 24,
+            TrainingProfile::Balanced => 60,
+            TrainingProfile::HighQuality => 150,
+        };
+
+        println!("\nSelf-play configuration (artistic):");
+        println!("  - Games: {}", self_play_config.num_games);
+        println!(
+            "  - Mixed opponent games: {} per difficulty",
+            self_play_config.num_mixed_games
+        );
+        println!(
+            "  - MCTS simulations: {}",
+            self_play_config.mcts_config.num_simulations
+        );
+        println!("  - Reward mode: Artistic (芸術的報酬)");
+        println!(
+            "  - Symmetry augmentation: {}",
+            self_play_config.augment_symmetry
+        );
+
+        println!("\nInitializing self-play engine with GPU (artistic)...");
+        let mcts = MctsSearch::new(
+            self_play_config.mcts_config,
+            self_play_model,
+            device.clone(),
+        );
+        let self_play = SelfPlayEngine::new(self_play_config, mcts, device.clone());
+
+        println!("\n--- Starting Self-Play (Artistic) ---");
+        let training_data = self_play.generate_data();
+
+        println!("\n--- Starting Training on GPU (Artistic) ---");
+        let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &device);
+
+        let mut training_config = build_training_config(profile, true);
+        training_config.checkpoint_dir = Some("checkpoints".to_string());
+        training_config.model_name = "honrou_model".to_string();
+        training_config.learning_rate *= 0.8;
+
+        let mut trainer = Trainer::new(training_config, training_model, device);
+        trainer.train(&training_data);
+
+        println!("\n========================================");
+        println!("  翻弄 Training Complete!");
+        println!("  Artistic patterns learned.");
+        println!("========================================");
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        println!("GPU support not enabled. Compile with --features wgpu");
+        println!("Falling back to CPU mode...");
+        run_training_mode_honrou(profile);
+    }
 }
