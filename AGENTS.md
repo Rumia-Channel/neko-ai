@@ -24,6 +24,10 @@ cargo run --features wgpu -- --training-gpu
 # Run training mode (Honrou / artistic reward)
 cargo run -- --training-honrou
 
+# Benchmark self-play / training throughput (release build strongly recommended)
+cargo run --release -- --bench 32 --sims 120
+cargo run --release -- --bench 32 --sims 120 --batch 1 --model standard
+
 # Check without building
 cargo check
 
@@ -31,15 +35,25 @@ cargo check
 cargo check --all-features
 ```
 
-NOTE: The `wgpu` feature enables the GPU (CubeCL/wgpu) backend used by
+CLI flags:
+- `--bench [games]` … CPU throughput benchmark (`--sims N`, `--batch N`, `--model light|standard`)
+- `--bench-gpu` … GPU (Vulkan/DX12) forward + training benchmark, needs `--features wgpu`
+- `--model light|standard` … network size (default `light`: 4 blocks x 64 filters, ~0.5M params)
+- `--fast` / `--balanced` / `--high` … training profile (default `high`)
+
+NOTE: The `wgpu` feature enables the GPU (Vulkan / WebGPU) backend used by
 `--training-gpu`. Without it, the binary builds CPU-only (Flex) and the GPU
 training modes fall back to CPU with a message.
 
-WARNING: the `wgpu` feature (and therefore `cargo check --all-features`) does **not**
-compile on Windows right now: `cubecl-wgpu 0.11` requires `wgpu 30.0.1`, whose
-`wgpu-hal` needs `windows 0.62` while its `gpu-allocator 0.28` dependency is capped at
-`windows <= 0.62` and resolves to 0.61. `wgpu 30.0.1` is the latest release, so there
-is no workaround except waiting for an upstream fix.
+The `wgpu` feature also enables the optional `windows = "0.62"` dependency (see
+`[target.'cfg(windows)'.dependencies]` in Cargo.toml). This is required: wgpu-hal 30
+needs `windows ^0.62` while its `gpu-allocator 0.28` dependency is specified as
+`>=0.53, <=0.62` and resolves to 0.61 on its own, so the two disagree on the
+`windows_core` types and the DX12 backend fails to compile. Pinning `windows` to 0.62
+in our own manifest unifies the graph. `Cargo.lock` is part of the fix and must keep
+`windows 0.62.2` (if the wgpu build ever breaks with `windows_core` mismatches, re-run
+`cargo update -p windows@0.61.3 --precise 0.62.2`). Verified: `cargo check --features wgpu`
+passes and `--bench-gpu` runs on the integrated Vulkan device.
 
 ## Test Commands
 
@@ -166,17 +180,31 @@ cargo test
 
 Key external crates:
 - `burn` (0.22.0): ML framework. Enabled features: `std`, `optim` (implies `autodiff`),
-  `flex`, `store`. `default-features = false`.
+  `flex`, `simd`, `rayon`, `store`. `default-features = false`.
   - CPU execution uses the pure-Rust **Flex** backend (`Device::flex()`); the `ndarray`
     backend is deprecated in 0.22.
+  - `simd` + `rayon` are **required**: with `default-features = false` the Flex defaults
+    are dropped, and without them Flex runs scalar and single-threaded (measured ~10x
+    slower). If CPU training looks slow, check `cargo tree -i rayon` still lists burn-flex.
   - The `cpu` (CubeCL CPU) feature is intentionally **not** enabled: it pulls
     cubecl-cpu -> tracel-llvm -> liblzma-sys and builds an LLVM bundle.
   - GPU backends (`webgpu` + `vulkan`) are enabled by this crate's own `wgpu` feature.
-- `eframe` (0.36.2): GUI framework, `default-features = false` with `glow` renderer.
-  - The default `wgpu` renderer is avoided because wgpu 30.0.1 does not compile on
-    Windows: `wgpu-hal` requires `windows 0.62` while its `gpu-allocator 0.28` dependency
-    is capped at `windows <= 0.62` (resolves to 0.61), so the types mismatch (LNK/E0277).
+- `eframe` (0.36.2): GUI framework, `default-features = false` with the `glow` renderer
+  (the GUI is 2D only; wgpu is reserved for the training backend behind the `wgpu` feature).
 - `rand` (0.10.0): Random number generation
+
+### CPU performance notes (measured on i7-1355U, 12 threads)
+
+- Self-play runs one game per worker thread (`SelfPlayEngine::run_games`), each with its
+  own forked `MctsSearch` (shared weights, private eval cache). Without this the whole
+  pipeline ran on ~1 core.
+- `MctsConfig::eval_batch_size` defaults to **1**. The batched leaf selection is not
+  sequential, so larger batches re-evaluate the same leaf (8 duplicates measured) and
+  cost ~3x more per useful expansion than batch 1.
+- Default model is `light` (4 blocks x 64 filters, ~57 MFLOP/position); `--model standard`
+  (10 x 256, ~230 MFLOP/position) is 4x slower and only makes sense on a strong GPU.
+- Training throughput is ~390 examples/sec; self-play ~2500 simulations/sec. A full
+  `--training-fast` run (56 games x 120 sims + 20 epochs) takes ~22 min.
 
 ### burn 0.22 API notes (migrated from 0.20)
 

@@ -20,6 +20,69 @@ pub struct AlphaZeroModelConfig {
     pub num_filters: usize,
 }
 
+impl AlphaZeroModelConfig {
+    /// CPU (Flex) 学習向けの軽量構成。
+    ///
+    /// GPU 前提の既定構成（10 blocks x 256 filters, 約 1,180 万パラメータ、
+    /// 1 局面あたり約 230 MFLOP）は、ノート PC の CPU では 1 手の推論が重すぎて
+    /// 学習が進まない。8x8 オセロには十分な規模まで落とす
+    /// （約 50 万パラメータ、1 局面あたり約 57 MFLOP ≒ 4 倍速）。
+    pub fn light() -> Self {
+        Self::new().with_num_res_blocks(4).with_num_filters(64)
+    }
+
+    /// GPU 学習向けの標準構成。
+    pub fn standard() -> Self {
+        Self::new()
+    }
+
+    /// モデル本体に添えて保存する構成ファイルのパス。
+    ///
+    /// burnpack の記録にはテンソルしか入らず構成は復元できないため、
+    /// 推論時に同じ構成で組み立てられるようサイドカーとして保存する。
+    pub fn sidecar_path(model_path: &str) -> String {
+        format!("{}.config", model_path)
+    }
+
+    /// 構成をサイドカーへ保存する（失敗しても学習自体は継続できる）
+    pub fn save_sidecar(&self, model_path: &str) -> std::io::Result<()> {
+        let body = format!(
+            "num_res_blocks={}\nnum_filters={}\n",
+            self.num_res_blocks, self.num_filters
+        );
+        std::fs::write(Self::sidecar_path(model_path), body)
+    }
+
+    /// サイドカーから構成を読み込む。無ければ None。
+    pub fn load_sidecar(model_path: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(Self::sidecar_path(model_path)).ok()?;
+
+        let mut config = Self::new();
+        let mut found = false;
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let Ok(value) = value.trim().parse::<usize>() else {
+                continue;
+            };
+            match key.trim() {
+                "num_res_blocks" => {
+                    config.num_res_blocks = value;
+                    found = true;
+                }
+                "num_filters" => {
+                    config.num_filters = value;
+                    found = true;
+                }
+                _ => {}
+            }
+        }
+
+        found.then_some(config)
+    }
+}
+
 /// Residual block for AlphaZero architecture
 #[derive(Module, Debug)]
 pub struct ResidualBlock {
@@ -201,6 +264,9 @@ impl AlphaZeroModel {
     /// Returns None if the file does not exist or loading fails.
     /// NOTE: burn 0.22 では記録形式が burnpack に変わり、旧 `.mpk` (MessagePack) の
     /// チェックポイントは読み込めない（再学習が必要）。
+    ///
+    /// モデル構成は保存時に書き出したサイドカー (`.config`) を優先して使う
+    /// （軽量構成で学習したモデルを既定構成で読み込むと形が合わないため）。
     pub fn load_trained(
         config: &AlphaZeroModelConfig,
         path: &str,
@@ -210,6 +276,8 @@ impl AlphaZeroModel {
             return None;
         }
 
+        let config = Self::load_sidecar_config(path).unwrap_or_else(|| config.clone());
+
         let record = match ModuleRecord::load(path) {
             Ok(record) => record,
             Err(e) => {
@@ -218,8 +286,22 @@ impl AlphaZeroModel {
             }
         };
 
-        let model = Self::new(config, device);
+        let model = Self::new(&config, device);
         Some(model.load_record(record))
+    }
+
+    /// サイドカーがあればその構成を、無ければ None を返す。
+    fn load_sidecar_config(path: &str) -> Option<AlphaZeroModelConfig> {
+        let config = AlphaZeroModelConfig::load_sidecar(path);
+        if let Some(ref config) = config {
+            println!(
+                "モデル構成を {} から読み込みました: {} blocks x {} filters",
+                AlphaZeroModelConfig::sidecar_path(path),
+                config.num_res_blocks,
+                config.num_filters
+            );
+        }
+        config
     }
 }
 

@@ -5,23 +5,28 @@ edition = "2024"
 
 [features]
 default = []
-# GPU (wgpu) バックエンド。`cargo run --features wgpu -- --training-gpu` で有効になる。
-wgpu = ["burn/webgpu", "burn/vulkan"]
+# GPU (Vulkan / WebGPU) バックエンド。`cargo run --features wgpu -- --training-gpu` で有効になる。
+# windows 0.62 の直接依存は、wgpu-hal と gpu-allocator の windows 版を統一するために必要
+# （詳細は下の [target.'cfg(windows)'.dependencies] のコメント参照）。
+wgpu = ["burn/webgpu", "burn/vulkan", "dep:windows"]
 
 [dependencies]
 # NOTE: burn の "cpu" (CubeCL CPU) feature は意図的に使わない。
 # cubecl-cpu → tracel-llvm → liblzma-sys を引き込み、LLVM バンドルのビルドが走るため。
 # CPU バックエンドは pure-Rust の "flex" を使う（"ndarray" は 0.22 で非推奨）。
+# "simd" と "rayon" は必須: これが無いと Flex はスカラー + 単一スレッドで動く
+# （default-features = false にすると burn-flex の既定 simd/rayon も落ちる）。
 # GPU (wgpu) はこのクレートの "wgpu" feature 経由で有効化する（既定は CPU のみ）。
 burn = { version = "0.22.0", default-features = false, features = [
     "std",
     "optim", # autodiff を含む
     "flex",
+    "simd",
+    "rayon",
     "store",
 ] }
-# NOTE: eframe 0.36 の既定は wgpu レンダラだが、wgpu 30.0.1 は Windows で
-# wgpu-hal(windows 0.62) と gpu-allocator 0.28(windows <=0.62) が衝突して
-# コンパイルできない（上流バグ）。GUI は 2D 描画のみなので glow を使う。
+# NOTE: eframe 0.36 の既定は wgpu レンダラだが、GUI は 2D 描画のみなので
+# glow（OpenGL）を使う。GPU 学習側の wgpu とは独立。
 eframe = { version = "0.36.2", default-features = false, features = [
     "accesskit",
     "default_fonts",
@@ -30,6 +35,16 @@ eframe = { version = "0.36.2", default-features = false, features = [
     "x11",
 ] }
 rand = "0.10.0"
+
+[target.'cfg(windows)'.dependencies]
+# wgpu-hal 30.0.1 は windows ^0.62 を要求するが、その依存 gpu-allocator 0.28 の
+# 指定 ">=0.53, <=0.62" は単独では windows 0.61 に解決され、型が食い違って
+# DX12 バックエンドがコンパイルできない（上流の依存指定ミス）。
+# ここで 0.62 を直接指定するとグラフ全体が windows 0.62.2 に統一され、
+# Vulkan / DX12 の両方がビルドできるようになる（"wgpu" feature 時のみ有効）。
+# Cargo.lock も 0.62.2 に統一済み:
+#   cargo update -p windows@0.61.3 --precise 0.62.2
+windows = { version = "0.62", optional = true }
 
 [profile.release]
 opt-level = 3

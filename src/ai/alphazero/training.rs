@@ -2,7 +2,7 @@
 //!
 //! Implements policy/value joint optimization with Adam.
 
-use crate::ai::alphazero::model::AlphaZeroModel;
+use crate::ai::alphazero::model::{AlphaZeroModel, AlphaZeroModelConfig};
 use crate::ai::alphazero::self_play::TrainingExample;
 use crate::game::BOARD_SIZE;
 
@@ -61,15 +61,23 @@ impl Default for TrainingConfig {
 /// 学習は「autodiff を有効にした [`Device`] の上でモデルとバッチを作る」ことで行う。
 pub struct Trainer {
     config: TrainingConfig,
+    /// チェックポイントに添えて保存するモデル構成（推論時の形を合わせるため）
+    model_config: AlphaZeroModelConfig,
     model: Option<AlphaZeroModel>,
     device: Device,
     mse_loss: MseLoss,
 }
 
 impl Trainer {
-    pub fn new(config: TrainingConfig, model: AlphaZeroModel, device: Device) -> Self {
+    pub fn new(
+        config: TrainingConfig,
+        model: AlphaZeroModel,
+        model_config: AlphaZeroModelConfig,
+        device: Device,
+    ) -> Self {
         Self {
             config,
+            model_config,
             model: Some(model),
             device,
             mse_loss: MseLoss::new(),
@@ -339,7 +347,13 @@ impl Trainer {
             .valid();
 
         match model.into_record().save(&path) {
-            Ok(_) => println!("Model saved to {}", path),
+            Ok(_) => {
+                // 推論側が同じ構成で組み立てられるよう構成も書き出す
+                if let Err(e) = self.model_config.save_sidecar(&path) {
+                    eprintln!("Failed to save model config sidecar: {}", e);
+                }
+                println!("Model saved to {}", path);
+            }
             Err(e) => eprintln!("Failed to save model: {:?}", e),
         }
     }
@@ -385,7 +399,7 @@ mod tests {
         };
 
         let examples = dummy_examples(4);
-        let mut trainer = Trainer::new(config, model, training_device);
+        let mut trainer = Trainer::new(config, model, model_config.clone(), training_device);
         trainer.train(&examples);
 
         let loss = trainer.validate(&examples);
@@ -404,7 +418,12 @@ mod tests {
         dir.push("neko-ai-checkpoint-test");
         let dir_str = dir.to_string_lossy().to_string();
 
-        let trainer = Trainer::new(TrainingConfig::default(), model, training_device);
+        let trainer = Trainer::new(
+            TrainingConfig::default(),
+            model,
+            model_config.clone(),
+            training_device,
+        );
         trainer.save_model_stub(&dir_str, "unit_test_model");
 
         let mut path = dir.clone();
@@ -419,5 +438,25 @@ mod tests {
         let model_path = path.to_string_lossy().to_string();
         let loaded = AlphaZeroModel::load_trained(&model_config, &model_path, &device);
         assert!(loaded.is_some(), "checkpoint could not be loaded");
+
+        // 学習時と違う構成（既定の重い構成）を渡しても、サイドカーの構成で読み込めること。
+        // サイドカーが効いていなければ形状不一致で失敗する。
+        let wrong_config = AlphaZeroModelConfig::standard();
+        let loaded = AlphaZeroModel::load_trained(&wrong_config, &model_path, &device);
+        assert!(
+            loaded.is_some(),
+            "checkpoint should be loadable via the config sidecar"
+        );
+
+        // モデル構成のサイドカーが保存され、同じ構成が復元できること
+        let sidecar = AlphaZeroModelConfig::sidecar_path(&model_path);
+        assert!(
+            std::path::Path::new(&sidecar).exists(),
+            "config sidecar was not written: {sidecar}"
+        );
+        let restored = AlphaZeroModelConfig::load_sidecar(&model_path)
+            .expect("config sidecar should be parseable");
+        assert_eq!(restored.num_res_blocks, model_config.num_res_blocks);
+        assert_eq!(restored.num_filters, model_config.num_filters);
     }
 }

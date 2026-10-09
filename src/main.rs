@@ -54,15 +54,20 @@ fn main() {
     let is_gpu = args.iter().any(|arg| arg.ends_with("-gpu"));
     let is_honrou = args.iter().any(|arg| arg.contains("honrou"));
     let is_training = args.iter().any(|arg| arg.starts_with("--training"));
+    let model_config = model_config_from_args(&args);
 
-    if is_training && is_honrou && is_gpu {
-        run_training_mode_honrou_gpu(profile);
+    if args.iter().any(|arg| arg == "--bench") {
+        run_bench_mode(&args);
+    } else if args.iter().any(|arg| arg == "--bench-gpu") {
+        run_bench_gpu_mode(&args);
+    } else if is_training && is_honrou && is_gpu {
+        run_training_mode_honrou_gpu(profile, &model_config);
     } else if is_training && is_honrou {
-        run_training_mode_honrou(profile);
+        run_training_mode_honrou(profile, &model_config);
     } else if is_training && is_gpu {
-        run_training_mode_gpu(profile);
+        run_training_mode_gpu(profile, &model_config);
     } else if is_training {
-        run_training_mode(profile);
+        run_training_mode(profile, &model_config);
     } else if let Err(e) = run_gui_mode() {
         eprintln!("Error running GUI: {}", e);
         std::process::exit(1);
@@ -195,10 +200,12 @@ fn run_gui_mode() -> eframe::Result {
 }
 
 fn build_self_play_config(profile: TrainingProfile, is_gpu: bool) -> SelfPlayConfig {
+    // CPU プロファイルはノート PC でも現実的な時間で終わる規模に抑える
+    // （1 手あたりの推論コストに比例するため、sims 数が支配的）。
     let (num_games, num_simulations, checkpoint_interval) = match (profile, is_gpu) {
-        (TrainingProfile::Fast, false) => (24, 160, 4),
-        (TrainingProfile::Balanced, false) => (80, 420, 8),
-        (TrainingProfile::HighQuality, false) => (220, 900, 10),
+        (TrainingProfile::Fast, false) => (32, 120, 4),
+        (TrainingProfile::Balanced, false) => (64, 200, 8),
+        (TrainingProfile::HighQuality, false) => (128, 320, 10),
         (TrainingProfile::Fast, true) => (64, 320, 8),
         (TrainingProfile::Balanced, true) => (240, 900, 12),
         (TrainingProfile::HighQuality, true) => (900, 1_600, 20),
@@ -206,8 +213,8 @@ fn build_self_play_config(profile: TrainingProfile, is_gpu: bool) -> SelfPlayCon
 
     let num_mixed_games = match (profile, is_gpu) {
         (TrainingProfile::Fast, false) => 8,
-        (TrainingProfile::Balanced, false) => 20,
-        (TrainingProfile::HighQuality, false) => 50,
+        (TrainingProfile::Balanced, false) => 16,
+        (TrainingProfile::HighQuality, false) => 32,
         (TrainingProfile::Fast, true) => 16,
         (TrainingProfile::Balanced, true) => 40,
         (TrainingProfile::HighQuality, true) => 100,
@@ -233,6 +240,7 @@ fn build_self_play_config(profile: TrainingProfile, is_gpu: bool) -> SelfPlayCon
             max_search_time_ms: None,
             min_simulations_before_stop: num_simulations / 2,
             early_stop_visit_ratio: Some(0.97),
+            eval_batch_size: 1,
         },
         augment_symmetry: true,
         max_moves_per_game: 120,
@@ -255,24 +263,24 @@ fn build_training_config(profile: TrainingProfile, is_gpu: bool) -> TrainingConf
             model_name: "best_model".to_string(),
         },
         (TrainingProfile::Balanced, false) => TrainingConfig {
-            num_epochs: 70,
-            batch_size: 192,
+            num_epochs: 40,
+            batch_size: 256,
             learning_rate: 0.001,
             lr_decay: 0.6,
             lr_decay_epochs: 15,
-            steps_per_epoch: 1_200,
+            steps_per_epoch: 800,
             validation_split: 0.1,
             checkpoint_dir: Some("checkpoints".to_string()),
             save_every: 10,
             model_name: "best_model".to_string(),
         },
         (TrainingProfile::HighQuality, false) => TrainingConfig {
-            num_epochs: 140,
+            num_epochs: 60,
             batch_size: 256,
             learning_rate: 0.0008,
             lr_decay: 0.5,
             lr_decay_epochs: 20,
-            steps_per_epoch: 2_200,
+            steps_per_epoch: 1_500,
             validation_split: 0.1,
             checkpoint_dir: Some("checkpoints".to_string()),
             save_every: 10,
@@ -317,7 +325,33 @@ fn build_training_config(profile: TrainingProfile, is_gpu: bool) -> TrainingConf
     }
 }
 
-fn run_training_mode(profile: TrainingProfile) {
+/// 使用するモデル構成を引数から決める。
+///
+/// 既定は CPU（ノート PC でも回る）向けの軽量構成。大きい構成を使いたい場合は
+/// `--model standard` を指定する。
+fn model_config_from_args(args: &[String]) -> AlphaZeroModelConfig {
+    for (index, arg) in args.iter().enumerate() {
+        if arg != "--model" {
+            continue;
+        }
+        match args.get(index + 1).map(|value| value.as_str()) {
+            Some("standard") | Some("large") => return AlphaZeroModelConfig::standard(),
+            Some("light") | Some("small") => return AlphaZeroModelConfig::light(),
+            _ => {}
+        }
+    }
+
+    AlphaZeroModelConfig::light()
+}
+
+/// 利用可能なスレッド数
+fn available_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+}
+
+fn run_training_mode(profile: TrainingProfile, model_config: &AlphaZeroModelConfig) {
     println!("========================================");
     println!("  AlphaZero Training Mode (CPU)");
     println!("========================================\n");
@@ -327,15 +361,14 @@ fn run_training_mode(profile: TrainingProfile) {
 
     // CPU 推論・学習には pure-Rust の Flex バックエンドを使う
     let device = Device::flex();
-    println!("Using device: CPU (Flex)");
+    println!("Using device: CPU (Flex), threads: {}", available_threads());
 
     // Create model configuration
-    let model_config = AlphaZeroModelConfig::new();
     println!("Initializing AlphaZero model...");
     println!("  - Residual blocks: {}", model_config.num_res_blocks);
     println!("  - Filters: {}", model_config.num_filters);
 
-    let self_play_model = AlphaZeroModel::new(&model_config, &device);
+    let self_play_model = AlphaZeroModel::new(model_config, &device);
 
     let self_play_config = build_self_play_config(profile, false);
     println!("\nSelf-play configuration:");
@@ -363,10 +396,15 @@ fn run_training_mode(profile: TrainingProfile) {
     println!("\n--- Starting Training ---");
     // 学習は autodiff を有効にしたデバイスで行う
     let training_device = device.clone().autodiff();
-    let training_model = AlphaZeroModel::new(&model_config, &training_device);
+    let training_model = AlphaZeroModel::new(model_config, &training_device);
     let training_config = build_training_config(profile, false);
 
-    let mut trainer = Trainer::new(training_config, training_model, training_device);
+    let mut trainer = Trainer::new(
+        training_config,
+        training_model,
+        model_config.clone(),
+        training_device,
+    );
     trainer.train(&training_data);
 
     println!("\n========================================");
@@ -375,7 +413,7 @@ fn run_training_mode(profile: TrainingProfile) {
 }
 
 #[allow(unexpected_cfgs)]
-fn run_training_mode_gpu(profile: TrainingProfile) {
+fn run_training_mode_gpu(profile: TrainingProfile, model_config: &AlphaZeroModelConfig) {
     println!("========================================");
     println!("  AlphaZero Training Mode (GPU)");
     println!("========================================\n");
@@ -389,15 +427,17 @@ fn run_training_mode_gpu(profile: TrainingProfile) {
         // due to CPU↔GPU transfer overhead per simulation.
         let cpu_device = Device::flex();
         let gpu_device = Device::wgpu(DeviceKind::DefaultDevice);
-        println!("Self-play device: CPU (Flex)");
+        println!(
+            "Self-play device: CPU (Flex), threads: {}",
+            available_threads()
+        );
         println!("Training device:  GPU (WGPU)");
 
-        let model_config = AlphaZeroModelConfig::new();
         println!("Initializing AlphaZero model...");
         println!("  - Residual blocks: {}", model_config.num_res_blocks);
         println!("  - Filters: {}", model_config.num_filters);
 
-        let self_play_model = AlphaZeroModel::new(&model_config, &cpu_device);
+        let self_play_model = AlphaZeroModel::new(model_config, &cpu_device);
         let self_play_config = build_self_play_config(profile, true);
         println!("\nSelf-play configuration:");
         println!("  - Games: {}", self_play_config.num_games);
@@ -423,10 +463,15 @@ fn run_training_mode_gpu(profile: TrainingProfile) {
 
         println!("\n--- Starting Training on GPU ---");
         let training_device = gpu_device.autodiff();
-        let training_model = AlphaZeroModel::new(&model_config, &training_device);
+        let training_model = AlphaZeroModel::new(model_config, &training_device);
         let training_config = build_training_config(profile, true);
 
-        let mut trainer = Trainer::new(training_config, training_model, training_device);
+        let mut trainer = Trainer::new(
+            training_config,
+            training_model,
+            model_config.clone(),
+            training_device,
+        );
         trainer.train(&training_data);
 
         println!("\n========================================");
@@ -438,11 +483,11 @@ fn run_training_mode_gpu(profile: TrainingProfile) {
     {
         println!("GPU support not enabled. Compile with --features wgpu");
         println!("Falling back to CPU mode...");
-        run_training_mode(profile);
+        run_training_mode(profile, model_config);
     }
 }
 
-fn run_training_mode_honrou(profile: TrainingProfile) {
+fn run_training_mode_honrou(profile: TrainingProfile, model_config: &AlphaZeroModelConfig) {
     println!("========================================");
     println!("  AlphaZero 翻弄 Training Mode (CPU)");
     println!("  Artistic Reward: 芸術的報酬");
@@ -452,14 +497,12 @@ fn run_training_mode_honrou(profile: TrainingProfile) {
     use burn::tensor::Device;
 
     let device = Device::flex();
-    println!("Using device: CPU (Flex)");
-
-    let model_config = AlphaZeroModelConfig::new();
+    println!("Using device: CPU (Flex), threads: {}", available_threads());
     println!("Initializing AlphaZero model (artistic)...");
     println!("  - Residual blocks: {}", model_config.num_res_blocks);
     println!("  - Filters: {}", model_config.num_filters);
 
-    let self_play_model = AlphaZeroModel::new(&model_config, &device);
+    let self_play_model = AlphaZeroModel::new(model_config, &device);
 
     // Build artistic self-play config
     let mut self_play_config = build_self_play_config(profile, false);
@@ -505,7 +548,7 @@ fn run_training_mode_honrou(profile: TrainingProfile) {
 
     println!("\n--- Starting Training (Artistic) ---");
     let training_device = device.clone().autodiff();
-    let training_model = AlphaZeroModel::new(&model_config, &training_device);
+    let training_model = AlphaZeroModel::new(model_config, &training_device);
 
     // 翻弄用トレーニング設定: より長い学習で芸術的パターンを定着
     let mut training_config = build_training_config(profile, false);
@@ -514,7 +557,12 @@ fn run_training_mode_honrou(profile: TrainingProfile) {
     // 芸術的報酬は値の範囲が広いため、学習率を少し下げて安定化
     training_config.learning_rate *= 0.8;
 
-    let mut trainer = Trainer::new(training_config, training_model, training_device);
+    let mut trainer = Trainer::new(
+        training_config,
+        training_model,
+        model_config.clone(),
+        training_device,
+    );
     trainer.train(&training_data);
 
     // 翻弄モデルとして保存
@@ -529,7 +577,7 @@ fn run_training_mode_honrou(profile: TrainingProfile) {
 }
 
 #[allow(unexpected_cfgs)]
-fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
+fn run_training_mode_honrou_gpu(profile: TrainingProfile, model_config: &AlphaZeroModelConfig) {
     println!("========================================");
     println!("  AlphaZero 翻弄 Training Mode (GPU)");
     println!("  Artistic Reward: 芸術的報酬");
@@ -542,15 +590,17 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
 
         let cpu_device = Device::flex();
         let gpu_device = Device::wgpu(DeviceKind::DefaultDevice);
-        println!("Self-play device: CPU (Flex)");
+        println!(
+            "Self-play device: CPU (Flex), threads: {}",
+            available_threads()
+        );
         println!("Training device:  GPU (WGPU)");
 
-        let model_config = AlphaZeroModelConfig::new();
         println!("Initializing AlphaZero model (artistic)...");
         println!("  - Residual blocks: {}", model_config.num_res_blocks);
         println!("  - Filters: {}", model_config.num_filters);
 
-        let self_play_model = AlphaZeroModel::new(&model_config, &cpu_device);
+        let self_play_model = AlphaZeroModel::new(model_config, &cpu_device);
 
         let mut self_play_config = build_self_play_config(profile, true);
         self_play_config.reward_mode = RewardMode::Artistic;
@@ -594,14 +644,19 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
 
         println!("\n--- Starting Training on GPU (Artistic) ---");
         let training_device = gpu_device.autodiff();
-        let training_model = AlphaZeroModel::new(&model_config, &training_device);
+        let training_model = AlphaZeroModel::new(model_config, &training_device);
 
         let mut training_config = build_training_config(profile, true);
         training_config.checkpoint_dir = Some("checkpoints".to_string());
         training_config.model_name = "honrou_model".to_string();
         training_config.learning_rate *= 0.8;
 
-        let mut trainer = Trainer::new(training_config, training_model, training_device);
+        let mut trainer = Trainer::new(
+            training_config,
+            training_model,
+            model_config.clone(),
+            training_device,
+        );
         trainer.train(&training_data);
 
         println!("\n========================================");
@@ -614,7 +669,232 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
     {
         println!("GPU support not enabled. Compile with --features wgpu");
         println!("Falling back to CPU mode...");
-        run_training_mode_honrou(profile);
+        run_training_mode_honrou(profile, model_config);
+    }
+}
+
+/// 自己対戦と学習の実測速度を表示する（ボトルネック確認用）。
+///
+/// 使い方: `cargo run --release -- --bench [ゲーム数] [--sims N] [--model light|standard]`
+fn run_bench_mode(args: &[String]) {
+    use burn::tensor::Device;
+    use std::time::Instant;
+
+    let position = |flag: &str| args.iter().position(|arg| arg == flag);
+
+    let games: usize = position("--bench")
+        .and_then(|index| args.get(index + 1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+    let simulations: usize = position("--sims")
+        .and_then(|index| args.get(index + 1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+    let eval_batch: usize = position("--batch")
+        .and_then(|index| args.get(index + 1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8);
+
+    let model_config = model_config_from_args(args);
+    let device = Device::flex();
+
+    println!("========================================");
+    println!("  Benchmark (CPU / Flex)");
+    println!("========================================");
+    println!("threads       : {}", available_threads());
+    println!(
+        "model         : {} blocks x {} filters",
+        model_config.num_res_blocks, model_config.num_filters
+    );
+    println!(
+        "self-play     : {} games, {} simulations/move",
+        games, simulations
+    );
+    println!("eval batch    : {}", eval_batch);
+
+    // NN フォワードのバッチ特性を測る。バッチを増やしても時間が増えないなら
+    // 1 演算あたりのオーバーヘッド支配で、MCTS のバッチ評価は効かないと判断できる。
+    {
+        use crate::game::BOARD_SIZE;
+        use burn::tensor::Tensor;
+
+        println!("\n--- forward pass scaling ---");
+        let probe_model = AlphaZeroModel::new(&model_config, &device);
+        for batch in [1usize, 4, 8, 32] {
+            let input = Tensor::<4>::zeros([batch, 3, BOARD_SIZE, BOARD_SIZE], &device);
+            let _ = probe_model.forward(input.clone()); // ウォームアップ
+            let start = Instant::now();
+            for _ in 0..5 {
+                let _ = probe_model.forward(input.clone());
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+            println!(
+                "batch {batch:>3}: {ms:>8.2} ms/forward ({:.2} ms/sample)",
+                ms / batch as f64
+            );
+        }
+    }
+
+    let model = AlphaZeroModel::new(&model_config, &device);
+    let self_play_config = SelfPlayConfig {
+        num_games: games,
+        num_mixed_games: 0,
+        checkpoint_interval: 1,
+        mcts_config: MctsConfig {
+            num_simulations: simulations,
+            max_search_time_ms: None,
+            min_simulations_before_stop: simulations,
+            early_stop_visit_ratio: None,
+            eval_batch_size: eval_batch,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mcts = MctsSearch::new(self_play_config.mcts_config, model, device.clone());
+    let engine = SelfPlayEngine::new(self_play_config, mcts, device.clone());
+
+    let start = Instant::now();
+    let training_data = engine.generate_data();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    // 1 局あたりの手数は「例数 / 8（対称拡張）」で概算できる
+    let moves = training_data.len() as f64 / 8.0;
+    let simulations_total = moves * simulations as f64;
+
+    println!("\n--- self-play ---");
+    println!("time          : {:.1}s", elapsed);
+    println!("games/sec     : {:.3}", games as f64 / elapsed);
+    println!(
+        "examples      : {} ({:.0} ex/sec)",
+        training_data.len(),
+        training_data.len() as f64 / elapsed
+    );
+    println!(
+        "mcts sims/sec : {:.0} (概算, {} moves total)",
+        simulations_total / elapsed,
+        moves as usize
+    );
+
+    let training_device = device.clone().autodiff();
+    let training_model = AlphaZeroModel::new(&model_config, &training_device);
+    let training_config = TrainingConfig {
+        num_epochs: 1,
+        steps_per_epoch: usize::MAX,
+        checkpoint_dir: None,
+        ..Default::default()
+    };
+    let mut trainer = Trainer::new(
+        training_config,
+        training_model,
+        model_config.clone(),
+        training_device,
+    );
+
+    // 初回はカーネル初期化を含むため、2 回目のエポックを計測する
+    trainer.train(&training_data);
+    let start = Instant::now();
+    trainer.train(&training_data);
+    let elapsed = start.elapsed().as_secs_f64();
+
+    println!("\n--- training (1 epoch, 全バッチ / ウォームアップ後) ---");
+    println!("time          : {:.1}s", elapsed);
+    println!(
+        "examples/sec  : {:.0}",
+        training_data.len() as f64 / elapsed
+    );
+}
+
+/// GPU (Vulkan / WebGPU) の速度を計測する。`--features wgpu` が必要。
+///
+/// 使い方: `cargo run --release --features wgpu -- --bench-gpu [--model light|standard]`
+#[allow(unexpected_cfgs)]
+fn run_bench_gpu_mode(args: &[String]) {
+    #[cfg(feature = "wgpu")]
+    {
+        use crate::game::BOARD_SIZE;
+        use burn::tensor::{Device, DeviceKind, Tensor};
+        use std::time::Instant;
+
+        let model_config = model_config_from_args(args);
+
+        println!("========================================");
+        println!("  Benchmark (GPU / wgpu = Vulkan or DX12)");
+        println!("========================================");
+        println!(
+            "model         : {} blocks x {} filters",
+            model_config.num_res_blocks, model_config.num_filters
+        );
+
+        let start = Instant::now();
+        let device = Device::wgpu(DeviceKind::DefaultDevice);
+        println!("device init   : {:.2?}", start.elapsed());
+        println!("device        : {device:?}");
+
+        // 順伝播（初回はカーネル生成が走るのでウォームアップしてから計測）
+        let model = AlphaZeroModel::new(&model_config, &device);
+        println!("\n--- forward pass ---");
+        for batch in [1usize, 32] {
+            let input = Tensor::<4>::zeros([batch, 3, BOARD_SIZE, BOARD_SIZE], &device);
+            let _ = model.forward(input.clone());
+            let start = Instant::now();
+            for _ in 0..5 {
+                let _ = model.forward(input.clone());
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+            println!(
+                "batch {batch:>3}: {ms:>8.2} ms/forward ({:.2} ms/sample)",
+                ms / batch as f64
+            );
+        }
+
+        // 学習 1 エポック（自己対戦は CPU で行うため、ここではダミーデータを使う）
+        let examples: Vec<crate::ai::alphazero::TrainingExample> = (0..512)
+            .map(|_| crate::ai::alphazero::TrainingExample {
+                board_tensor: vec![0.0; 3 * BOARD_SIZE * BOARD_SIZE],
+                target_policy: vec![
+                    1.0 / (BOARD_SIZE * BOARD_SIZE) as f32;
+                    BOARD_SIZE * BOARD_SIZE
+                ],
+                value: 0.0,
+            })
+            .collect();
+
+        let training_device = device.clone().autodiff();
+        let training_model = AlphaZeroModel::new(&model_config, &training_device);
+        let training_config = TrainingConfig {
+            num_epochs: 1,
+            batch_size: 256,
+            steps_per_epoch: usize::MAX,
+            checkpoint_dir: None,
+            ..Default::default()
+        };
+        let mut trainer = Trainer::new(
+            training_config,
+            training_model,
+            model_config.clone(),
+            training_device,
+        );
+
+        println!("\n--- training (1 epoch, {} examples) ---", examples.len());
+        let start = Instant::now();
+        trainer.train(&examples);
+        let first = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        trainer.train(&examples);
+        let elapsed = start.elapsed().as_secs_f64();
+        println!("1st epoch (warmup) : {first:.1}s");
+        println!(
+            "2nd epoch          : {elapsed:.1}s ({:.0} examples/sec)",
+            examples.len() as f64 / elapsed
+        );
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let _ = args;
+        println!("GPU support not enabled. Compile with --features wgpu");
     }
 }
 

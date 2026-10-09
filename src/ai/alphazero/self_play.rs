@@ -2,6 +2,11 @@
 //!
 //! Generates training examples by having the neural network play against itself
 //! and against conventional AI opponents (Easy/Medium/SlightlyHard).
+//!
+//! ゲーム同士は完全に独立なので、自己対戦はワーカー並列で実行する
+//! （探索器と評価キャッシュはワーカーごとに独立、モデルの重みは共有）。
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ai::alphazero::artistic::{ArtisticPattern, evaluate_artistic_reward};
 use crate::ai::alphazero::mcts::{MctsConfig, MctsSearch, select_move};
@@ -72,6 +77,9 @@ pub struct TrainingExample {
     pub value: f32,
 }
 
+/// 1 ゲーム分の結果
+type GameResult = (Vec<TrainingExample>, Option<ArtisticPattern>);
+
 /// Self-play engine
 pub struct SelfPlayEngine {
     config: SelfPlayConfig,
@@ -90,51 +98,20 @@ impl SelfPlayEngine {
 
     /// Generate training data through self-play and mixed opponent games
     pub fn generate_data(&self) -> Vec<TrainingExample> {
-        let mut all_examples = Vec::new();
         let start_time = std::time::Instant::now();
+        let mut all_examples = Vec::new();
         let mut patterns: Vec<ArtisticPattern> = Vec::new();
 
         // Phase 1: Self-play games
-        println!(
-            "Starting self-play for {} games (reward: {:?})...",
-            self.config.num_games, self.config.reward_mode
-        );
-
-        for game_idx in 0..self.config.num_games {
-            if game_idx % self.config.checkpoint_interval == 0 {
-                let elapsed = start_time.elapsed().as_secs_f32();
-                let games_per_sec = if elapsed > 0.0 {
-                    game_idx as f32 / elapsed
-                } else {
-                    0.0
-                };
-                println!(
-                    "Self-play progress: {}/{} games ({:.1} games/sec, {:.1}s elapsed)",
-                    game_idx, self.config.num_games, games_per_sec, elapsed
-                );
-            }
-
-            let game_start = std::time::Instant::now();
-            let (examples, pattern) = self.play_one_game();
-            let game_duration = game_start.elapsed();
-
-            if game_idx < 5 || game_idx % 10 == 0 {
-                println!("  Game {} completed in {:?}", game_idx + 1, game_duration);
-            }
-
-            if let Some(p) = pattern {
-                patterns.push(p);
-            }
+        for (examples, pattern) in self.run_games(self.config.num_games, "self-play", None) {
             all_examples.extend(examples);
+            if let Some(pattern) = pattern {
+                patterns.push(pattern);
+            }
         }
 
         // Phase 2: Mixed opponent games (vs Easy, Medium, SlightlyHard)
         if self.config.num_mixed_games > 0 {
-            println!(
-                "\nStarting mixed opponent games ({} per difficulty)...",
-                self.config.num_mixed_games
-            );
-
             let difficulties = [
                 AiDifficulty::Easy,
                 AiDifficulty::Medium,
@@ -142,33 +119,26 @@ impl SelfPlayEngine {
             ];
 
             for &difficulty in &difficulties {
-                println!(
-                    "  Playing {} games vs {}...",
-                    self.config.num_mixed_games,
-                    difficulty.as_str()
-                );
-
-                for game_idx in 0..self.config.num_mixed_games {
-                    let (examples, pattern) = self.play_vs_conventional_ai(difficulty);
-                    if let Some(p) = pattern {
-                        patterns.push(p);
-                    }
+                let label = format!("vs {}", difficulty.as_str());
+                for (examples, pattern) in
+                    self.run_games(self.config.num_mixed_games, &label, Some(difficulty))
+                {
                     all_examples.extend(examples);
-
-                    if game_idx % 10 == 0 && game_idx > 0 {
-                        println!("    {}/{} done", game_idx, self.config.num_mixed_games);
+                    if let Some(pattern) = pattern {
+                        patterns.push(pattern);
                     }
                 }
             }
         }
 
         let total_time = start_time.elapsed();
+        let total_games = self.config.num_games + self.config.num_mixed_games * 3;
         println!(
-            "\nGenerated {} training examples from {} self-play + {} mixed games in {:?}",
+            "\nGenerated {} training examples from {} games in {:?} ({:.2} games/sec)",
             all_examples.len(),
-            self.config.num_games,
-            self.config.num_mixed_games * 3,
-            total_time
+            total_games,
+            total_time,
+            total_games as f64 / total_time.as_secs_f64().max(f64::EPSILON)
         );
 
         // Print artistic pattern statistics if in artistic mode
@@ -179,8 +149,102 @@ impl SelfPlayEngine {
         all_examples
     }
 
+    /// 指定数のゲームをワーカー並列で実行する。
+    ///
+    /// ゲーム単位で状態を共有しないため、ワーカーごとに独立した探索器
+    /// （評価キャッシュ付き）とデバイスを持たせて並列に回す。
+    fn run_games(
+        &self,
+        num_games: usize,
+        label: &str,
+        opponent: Option<AiDifficulty>,
+    ) -> Vec<GameResult> {
+        if num_games == 0 {
+            return Vec::new();
+        }
+
+        let workers = self.worker_count(num_games);
+        let completed = AtomicUsize::new(0);
+        let progress_step = (num_games / 10).max(1);
+
+        println!(
+            "Starting {}: {} games, {} simulations/move, {} workers (reward: {:?})...",
+            label,
+            num_games,
+            self.config.mcts_config.num_simulations,
+            workers,
+            self.config.reward_mode
+        );
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+
+            for worker_index in 0..workers {
+                let games = games_for_worker(worker_index, num_games, workers);
+                if games == 0 {
+                    continue;
+                }
+
+                let worker = SelfPlayWorker {
+                    config: self.config,
+                    mcts: self.mcts.fork(),
+                    device: self.device.clone(),
+                };
+                let completed = &completed;
+
+                handles.push(scope.spawn(move || {
+                    let mut local = Vec::with_capacity(games);
+                    for _ in 0..games {
+                        local.push(match opponent {
+                            Some(difficulty) => worker.play_vs_conventional_ai(difficulty),
+                            None => worker.play_one_game(),
+                        });
+
+                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done.is_multiple_of(progress_step) || done == num_games {
+                            println!("  {}: {}/{} games done", label, done, num_games);
+                        }
+                    }
+                    local
+                }));
+            }
+
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        })
+    }
+
+    /// ワーカー数（利用可能スレッド数とゲーム数の小さい方）
+    fn worker_count(&self, num_games: usize) -> usize {
+        let threads = std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1);
+        threads.min(num_games).max(1)
+    }
+}
+
+/// ワーカーごとの担当ゲーム数（余りは先頭のワーカーへ配る）
+fn games_for_worker(index: usize, total: usize, workers: usize) -> usize {
+    if workers == 0 {
+        return 0;
+    }
+    total / workers + usize::from(index < total % workers)
+}
+
+/// ワーカー 1 つ分の自己対戦コンテキスト。
+///
+/// 探索器と評価キャッシュをワーカーごとに持つ（スレッド間で共有しない）。
+struct SelfPlayWorker {
+    config: SelfPlayConfig,
+    mcts: MctsSearch,
+    device: Device,
+}
+
+impl SelfPlayWorker {
     /// Play a single self-play game and return training examples + detected pattern
-    fn play_one_game(&self) -> (Vec<TrainingExample>, Option<ArtisticPattern>) {
+    fn play_one_game(&self) -> GameResult {
         let mut game = OthelloGame::default();
         let mut history: Vec<(Vec<f32>, Vec<f32>, Player)> = Vec::new();
         let mut move_count = 0usize;
@@ -232,10 +296,7 @@ impl SelfPlayEngine {
 
     /// Play a game against a conventional AI opponent.
     /// AlphaZero plays as Black (first player), opponent as White.
-    fn play_vs_conventional_ai(
-        &self,
-        difficulty: AiDifficulty,
-    ) -> (Vec<TrainingExample>, Option<ArtisticPattern>) {
+    fn play_vs_conventional_ai(&self, difficulty: AiDifficulty) -> GameResult {
         let mut game = OthelloGame::default();
         let mut history: Vec<(Vec<f32>, Vec<f32>, Player)> = Vec::new();
         let mut move_count = 0usize;

@@ -43,6 +43,12 @@ pub struct MctsConfig {
     pub min_simulations_before_stop: usize,
     /// Early stop when best move visit ratio reaches this value.
     pub early_stop_visit_ratio: Option<f32>,
+    /// Number of leaves evaluated per neural-network forward pass.
+    ///
+    /// 既定は 1（1 リーフずつ評価）。バッチ選択は逐次選択ではないため、
+    /// 2 以上にすると同じリーフを重複評価しやすく、探索が伸びないわりに
+    /// 計算だけ増える（実測: batch 8 は 1 リーフあたり約 3 倍の時間）。
+    pub eval_batch_size: usize,
 }
 
 impl Default for MctsConfig {
@@ -60,6 +66,7 @@ impl Default for MctsConfig {
             max_search_time_ms: Some(120),
             min_simulations_before_stop: 96,
             early_stop_visit_ratio: Some(0.92),
+            eval_batch_size: 1,
         }
     }
 }
@@ -173,6 +180,18 @@ impl MctsSearch {
         }
     }
 
+    /// 並列自己対戦用に、同じモデル（重みは共有）を持つ独立した探索器を作る。
+    ///
+    /// 評価キャッシュは共有せず、ワーカーごとに持たせる。
+    pub fn fork(&self) -> Self {
+        Self {
+            config: self.config,
+            model: self.model.clone(),
+            device: self.device.clone(),
+            eval_cache: RefCell::new(HashMap::new()),
+        }
+    }
+
     /// Generic search entrypoint (works for any Game trait object).
     pub fn search(&self, game: &dyn Game) -> Vec<(usize, usize, f32)> {
         self.search_dyn(game)
@@ -274,7 +293,7 @@ impl MctsSearch {
         }
 
         let start = Instant::now();
-        let batch_size = 8usize;
+        let batch_size = self.config.eval_batch_size.max(1);
         let mut simulation = 0usize;
 
         while simulation < self.config.num_simulations {
