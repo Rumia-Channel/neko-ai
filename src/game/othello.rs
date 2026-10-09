@@ -30,24 +30,6 @@ impl Default for OthelloGame {
 }
 
 impl OthelloGame {
-    /// Pass the current turn when no valid moves are available.
-    pub fn pass_turn(&mut self) {
-        if self.game_over {
-            return;
-        }
-
-        // Switch to opponent.
-        self.current_player = self.current_player.opposite();
-
-        // If opponent also has no valid moves, the game is over.
-        if !self.has_valid_moves(self.current_player) {
-            self.current_player = self.current_player.opposite();
-            if !self.has_valid_moves(self.current_player) {
-                self.game_over = true;
-            }
-        }
-    }
-
     fn check_direction(
         &self,
         row: usize,
@@ -199,6 +181,23 @@ impl Game for OthelloGame {
         }
     }
 
+    fn pass_turn(&mut self) {
+        if self.game_over {
+            return;
+        }
+
+        // Switch to opponent.
+        self.current_player = self.current_player.opposite();
+
+        // If opponent also has no valid moves, the game is over.
+        if !self.has_valid_moves(self.current_player) {
+            self.current_player = self.current_player.opposite();
+            if !self.has_valid_moves(self.current_player) {
+                self.game_over = true;
+            }
+        }
+    }
+
     fn has_valid_moves(&self, player: Player) -> bool {
         for row in 0..BOARD_SIZE {
             for col in 0..BOARD_SIZE {
@@ -229,5 +228,114 @@ impl Game for OthelloGame {
 
     fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_moves(game: &OthelloGame) -> Vec<(usize, usize)> {
+        (0..BOARD_SIZE)
+            .flat_map(|row| (0..BOARD_SIZE).map(move |col| (row, col)))
+            .filter(|(row, col)| game.is_valid_move(*row, *col))
+            .collect()
+    }
+
+    #[test]
+    fn initial_position_is_standard() {
+        let game = OthelloGame::default();
+
+        assert_eq!(game.current_player(), Player::Black);
+        assert!(!game.is_game_over());
+        assert_eq!(game.black_count(), 2);
+        assert_eq!(game.white_count(), 2);
+        assert_eq!(game.board()[3][3], Cell::White);
+        assert_eq!(game.board()[3][4], Cell::Black);
+        assert_eq!(game.board()[4][3], Cell::Black);
+        assert_eq!(game.board()[4][4], Cell::White);
+    }
+
+    #[test]
+    fn black_has_four_opening_moves() {
+        let game = OthelloGame::default();
+        let mut moves = valid_moves(&game);
+        moves.sort_unstable();
+
+        assert_eq!(moves, vec![(2, 3), (3, 2), (4, 5), (5, 4)]);
+    }
+
+    #[test]
+    fn making_a_move_flips_bracketed_stones() {
+        let mut game = OthelloGame::default();
+        game.make_move(2, 3);
+
+        // (3,3) の白が挟まれて黒になる
+        assert_eq!(game.board()[2][3], Cell::Black);
+        assert_eq!(game.board()[3][3], Cell::Black);
+        assert_eq!(game.black_count(), 4);
+        assert_eq!(game.white_count(), 1);
+        assert_eq!(game.current_player(), Player::White);
+    }
+
+    #[test]
+    fn invalid_move_is_ignored() {
+        let mut game = OthelloGame::default();
+        let before = *game.board();
+
+        game.make_move(0, 0);
+
+        assert_eq!(*game.board(), before);
+        assert_eq!(game.current_player(), Player::Black);
+    }
+
+    #[test]
+    fn pass_turn_ends_game_when_neither_player_can_move() {
+        let mut game = OthelloGame::default();
+        for row in game.board.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = Cell::Empty;
+            }
+        }
+        // 互いに挟めない位置へ 1 石ずつ置く
+        game.board[0][0] = Cell::Black;
+        game.board[7][7] = Cell::White;
+        game.current_player = Player::Black;
+        game.count_pieces();
+
+        assert!(!game.has_valid_moves(Player::Black));
+        assert!(!game.has_valid_moves(Player::White));
+
+        game.pass_turn();
+
+        assert!(game.is_game_over());
+        assert_eq!(game.black_count(), 1);
+        assert_eq!(game.white_count(), 1);
+        // 1:1 の引き分け
+        assert_eq!(game.winner(), None);
+    }
+
+    #[test]
+    fn pass_turn_hands_over_the_turn() {
+        let mut game = OthelloGame::default();
+        // 黒が打てる初期局面でパスすると白の手番になる（ゲームは継続）
+        game.pass_turn();
+
+        assert_eq!(game.current_player(), Player::White);
+        assert!(!game.is_game_over());
+    }
+
+    #[test]
+    fn reset_restores_the_initial_position() {
+        let mut game = OthelloGame::default();
+        game.make_move(2, 3);
+        game.make_move(2, 2);
+
+        game.reset();
+
+        assert_eq!(game.black_count(), 2);
+        assert_eq!(game.white_count(), 2);
+        assert_eq!(game.current_player(), Player::Black);
+        assert!(!game.is_game_over());
     }
 }

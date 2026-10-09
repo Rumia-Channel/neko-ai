@@ -1,13 +1,10 @@
+use burn::tensor::{Device, Tensor, TensorData};
+
 use crate::game::{BOARD_SIZE, Cell, Game, Player};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
 
 /// Neural network input: 8x8 board with 3 channels (empty, black, white)
 /// Returns a tensor of shape [1, 3, 8, 8]
-pub fn board_to_tensor<B: Backend>(
-    board: &[[Cell; BOARD_SIZE]; BOARD_SIZE],
-    device: &B::Device,
-) -> Tensor<B, 4> {
+pub fn board_to_tensor(board: &[[Cell; BOARD_SIZE]; BOARD_SIZE], device: &Device) -> Tensor<4> {
     let mut empty = Vec::with_capacity(BOARD_SIZE * BOARD_SIZE);
     let mut black = Vec::with_capacity(BOARD_SIZE * BOARD_SIZE);
     let mut white = Vec::with_capacity(BOARD_SIZE * BOARD_SIZE);
@@ -51,15 +48,12 @@ pub fn board_to_tensor<B: Backend>(
 }
 
 /// Convert board and current player to neural network input
-pub fn game_to_tensor<B: Backend>(game: &dyn Game, device: &B::Device) -> Tensor<B, 4> {
+pub fn game_to_tensor(game: &dyn Game, device: &Device) -> Tensor<4> {
     game_to_tensor_for(game, device)
 }
 
 /// Generic version of `game_to_tensor` to avoid trait-object dispatch when possible.
-pub fn game_to_tensor_for<B: Backend, G: Game + ?Sized>(
-    game: &G,
-    device: &B::Device,
-) -> Tensor<B, 4> {
+pub fn game_to_tensor_for<G: Game + ?Sized>(game: &G, device: &Device) -> Tensor<4> {
     let board = game.board();
     let current = game.current_player();
 

@@ -6,18 +6,18 @@ use crate::ai::AiPlayer;
 use crate::ai::alphazero::mcts::{MctsConfig, MctsSearch};
 use crate::ai::alphazero::model::AlphaZeroModel;
 use crate::game::{Game, Player};
-use burn::tensor::backend::Backend;
+use burn::tensor::Device;
 
 /// AlphaZero AI player that uses neural network + MCTS
 #[derive(Debug)]
-pub struct AlphaZeroPlayer<B: Backend> {
+pub struct AlphaZeroPlayer {
     player: Player,
-    mcts_search: MctsSearch<B>,
+    mcts_search: MctsSearch,
 }
 
-impl<B: Backend> AlphaZeroPlayer<B> {
+impl AlphaZeroPlayer {
     /// Create a new AlphaZero player
-    pub fn new(player: Player, mcts_search: MctsSearch<B>) -> Self {
+    pub fn new(player: Player, mcts_search: MctsSearch) -> Self {
         Self {
             player,
             mcts_search,
@@ -25,19 +25,19 @@ impl<B: Backend> AlphaZeroPlayer<B> {
     }
 
     /// Create player with default configuration
-    pub fn with_model(player: Player, model: AlphaZeroModel<B>, device: B::Device) -> Self {
+    pub fn with_model(player: Player, model: AlphaZeroModel, device: Device) -> Self {
         let config = MctsConfig::default();
         let search = MctsSearch::new(config, model, device);
         Self::new(player, search)
     }
 
     /// Get the MCTS search instance (for training)
-    pub fn mcts_search(&self) -> &MctsSearch<B> {
+    pub fn mcts_search(&self) -> &MctsSearch {
         &self.mcts_search
     }
 }
 
-impl<B: Backend> AiPlayer for AlphaZeroPlayer<B> {
+impl AiPlayer for AlphaZeroPlayer {
     fn name(&self) -> &'static str {
         "AlphaZero"
     }

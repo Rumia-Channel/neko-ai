@@ -5,11 +5,30 @@ edition = "2024"
 
 [features]
 default = []
-wgpu = []
+# GPU (wgpu) バックエンド。`cargo run --features wgpu -- --training-gpu` で有効になる。
+wgpu = ["burn/webgpu", "burn/vulkan"]
 
 [dependencies]
-burn = { version = "0.20.1", features = ["cpu", "webgpu", "vulkan", "ndarray", "autodiff", "store"] }
-eframe = "0.33.3"
+# NOTE: burn の "cpu" (CubeCL CPU) feature は意図的に使わない。
+# cubecl-cpu → tracel-llvm → liblzma-sys を引き込み、LLVM バンドルのビルドが走るため。
+# CPU バックエンドは pure-Rust の "flex" を使う（"ndarray" は 0.22 で非推奨）。
+# GPU (wgpu) はこのクレートの "wgpu" feature 経由で有効化する（既定は CPU のみ）。
+burn = { version = "0.22.0", default-features = false, features = [
+    "std",
+    "optim", # autodiff を含む
+    "flex",
+    "store",
+] }
+# NOTE: eframe 0.36 の既定は wgpu レンダラだが、wgpu 30.0.1 は Windows で
+# wgpu-hal(windows 0.62) と gpu-allocator 0.28(windows <=0.62) が衝突して
+# コンパイルできない（上流バグ）。GUI は 2D 描画のみなので glow を使う。
+eframe = { version = "0.36.2", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 rand = "0.10.0"
 
 [profile.release]

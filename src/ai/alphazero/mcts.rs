@@ -10,8 +10,7 @@ use crate::ai::alphazero::model::AlphaZeroModel;
 use crate::ai::alphazero::tensor_utils::game_to_tensor_for;
 use crate::game::{BOARD_SIZE, Cell, Game, OthelloGame, Player};
 use burn::tensor::activation::softmax;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData};
 use rand::RngExt;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -87,6 +86,12 @@ pub struct MctsChild {
 /// Tree node for MCTS
 #[derive(Debug, Clone)]
 pub struct MctsNode {
+    /// このノードで手番を持つプレイヤー。
+    ///
+    /// オセロはパスがあるため 1 手（1 エッジ）で手番が入れ替わらないことがある。
+    /// 値の符号はパリティではなく、この手番の一致で決める必要がある。
+    /// 子ノードは降下時に確定する（未訪問ノードの Q 値は 0 なので選択には影響しない）。
+    pub player: Player,
     /// Number of times this node has been visited
     pub visit_count: usize,
     /// Total value accumulated from all simulations
@@ -104,6 +109,8 @@ pub struct MctsNode {
 impl MctsNode {
     pub fn new(prior: f32) -> Self {
         Self {
+            // 手番は降下時に設定される
+            player: Player::Black,
             visit_count: 0,
             total_value: 0.0,
             prior,
@@ -115,6 +122,7 @@ impl MctsNode {
 
     pub fn new_terminal(value: f32) -> Self {
         Self {
+            player: Player::Black,
             visit_count: 0,
             total_value: value,
             prior: 0.0,
@@ -134,17 +142,29 @@ impl MctsNode {
     }
 }
 
+/// ノードの手番視点の値へ変換する。
+///
+/// `leaf_player` と手番が同じならそのまま、違えば符号を反転する。
+/// オセロはパスがあるため、経路長のパリティでは正しい符号にならない。
+fn orient_for(node_player: Player, leaf_player: Player, leaf_value: f32) -> f32 {
+    if node_player == leaf_player {
+        leaf_value
+    } else {
+        -leaf_value
+    }
+}
+
 /// MCTS search engine
 #[derive(Debug)]
-pub struct MctsSearch<B: Backend> {
+pub struct MctsSearch {
     config: MctsConfig,
-    model: AlphaZeroModel<B>,
-    device: B::Device,
+    model: AlphaZeroModel,
+    device: Device,
     eval_cache: RefCell<HashMap<BoardKey, CachedEvaluation>>,
 }
 
-impl<B: Backend> MctsSearch<B> {
-    pub fn new(config: MctsConfig, model: AlphaZeroModel<B>, device: B::Device) -> Self {
+impl MctsSearch {
+    pub fn new(config: MctsConfig, model: AlphaZeroModel, device: Device) -> Self {
         Self {
             config,
             model,
@@ -207,21 +227,25 @@ impl<B: Backend> MctsSearch<B> {
 
                 game_copy.make_move(move_idx / BOARD_SIZE, move_idx % BOARD_SIZE);
                 current = &mut current.children[child_index].node;
+                // パスがあるため、子ノードの手番は実際の局面から取得する
+                current.player = game_copy.current_player();
             }
 
             // Expansion + evaluation
+            let leaf_player = game_copy.current_player();
             let leaf_value = if game_copy.is_game_over() {
-                self.get_terminal_value(game_copy.as_ref(), game_copy.current_player())
+                self.get_terminal_value(game_copy.as_ref(), leaf_player)
             } else {
                 let expanded = self.evaluate_node(game_copy.as_ref());
                 let value = expanded.total_value;
                 current.children = expanded.children;
                 current.is_terminal = expanded.is_terminal;
                 current.terminal_value = expanded.terminal_value;
+                current.player = expanded.player;
                 value
             };
 
-            self.backup(&mut root, &path, leaf_value);
+            Self::backup(&mut root, &path, leaf_player, leaf_value);
 
             if self.should_stop_early(&root, simulation + 1, start) {
                 break;
@@ -258,19 +282,19 @@ impl<B: Backend> MctsSearch<B> {
             let current_batch = batch_end - simulation;
 
             // Phase 1: Selection — collect leaves (read-only tree traversal)
-            let mut leaves: Vec<(Vec<usize>, G)> = Vec::with_capacity(current_batch);
+            let mut leaves: Vec<(Vec<usize>, Vec<Player>, G)> = Vec::with_capacity(current_batch);
             for _ in 0..current_batch {
-                let (path, leaf_game) = self.select_leaf_typed(&root, game);
-                leaves.push((path, leaf_game));
+                let (path, players, leaf_game) = self.select_leaf_typed(&root, game);
+                leaves.push((path, players, leaf_game));
             }
 
             // Phase 2: Batch evaluate non-terminal leaves
             let values = self.batch_evaluate_leaves(&leaves);
 
             // Phase 3: Expand and backpropagate
-            for (i, (path, leaf_game)) in leaves.into_iter().enumerate() {
+            for (i, (path, players, leaf_game)) in leaves.into_iter().enumerate() {
                 let value = values[i];
-                self.expand_and_backup_typed(&mut root, &path, &leaf_game, value);
+                self.expand_and_backup_typed(&mut root, &path, &players, &leaf_game, value);
             }
 
             simulation = batch_end;
@@ -284,12 +308,18 @@ impl<B: Backend> MctsSearch<B> {
     }
 
     /// Select a leaf node by traversing the tree (read-only).
-    /// Returns the path (child indices) and the game state at the leaf.
-    fn select_leaf_typed<G>(&self, root: &MctsNode, game: &G) -> (Vec<usize>, G)
+    ///
+    /// Returns the path (child indices), the player to move at each node along the way
+    /// (index 0 is the root) and the game state at the leaf. パスがあるため手番は
+    /// 経路長のパリティでは求まらないので、実際の局面から記録する。
+    fn select_leaf_typed<G>(&self, root: &MctsNode, game: &G) -> (Vec<usize>, Vec<Player>, G)
     where
         G: Game + Clone,
     {
         let mut path: Vec<usize> = Vec::with_capacity(64);
+        let mut players: Vec<Player> = Vec::with_capacity(65);
+        players.push(game.current_player());
+
         let mut game_copy = game.clone();
         let mut current = root;
 
@@ -299,14 +329,15 @@ impl<B: Backend> MctsSearch<B> {
             path.push(child_index);
             game_copy.make_move(move_idx / BOARD_SIZE, move_idx % BOARD_SIZE);
             current = &current.children[child_index].node;
+            players.push(game_copy.current_player());
         }
 
-        (path, game_copy)
+        (path, players, game_copy)
     }
 
     /// Batch evaluate multiple leaf positions.
     /// Returns a value for each leaf (terminal leaves get exact values, others get NN eval).
-    fn batch_evaluate_leaves<G>(&self, leaves: &[(Vec<usize>, G)]) -> Vec<f32>
+    fn batch_evaluate_leaves<G>(&self, leaves: &[(Vec<usize>, Vec<Player>, G)]) -> Vec<f32>
     where
         G: Game + Clone,
     {
@@ -315,7 +346,7 @@ impl<B: Backend> MctsSearch<B> {
         let mut nn_games: Vec<&G> = Vec::new();
 
         // Separate terminal leaves from those needing NN evaluation
-        for (i, (_, leaf_game)) in leaves.iter().enumerate() {
+        for (i, (_, _, leaf_game)) in leaves.iter().enumerate() {
             if leaf_game.is_game_over() {
                 values[i] = self.get_terminal_value(leaf_game, leaf_game.current_player());
             } else {
@@ -342,7 +373,7 @@ impl<B: Backend> MctsSearch<B> {
                 values[leaf_idx] = *value;
 
                 // Cache the result
-                let (_, leaf_game) = &leaves[leaf_idx];
+                let (_, _, leaf_game) = &leaves[leaf_idx];
                 let key = Self::board_key(leaf_game);
                 let mut cache = self.eval_cache.borrow_mut();
                 if cache.len() >= self.config.eval_cache_size {
@@ -435,19 +466,28 @@ impl<B: Backend> MctsSearch<B> {
         &self,
         root: &mut MctsNode,
         path: &[usize],
+        players: &[Player],
         leaf_game: &G,
         leaf_value: f32,
     ) where
         G: Game + Clone,
     {
-        // Expand the leaf (if not terminal and not yet expanded)
-        if !leaf_game.is_game_over() {
+        // 経路ノードの手番を確定させ、必要ならリーフを展開する
+        {
             let mut current = &mut *root;
-            for &child_index in path {
-                current = &mut current.children[child_index].node;
+            if let Some(&player) = players.first() {
+                current.player = player;
             }
 
-            if current.children.is_empty() {
+            for (index, &child_index) in path.iter().enumerate() {
+                current = &mut current.children[child_index].node;
+                if let Some(&player) = players.get(index + 1) {
+                    current.player = player;
+                }
+            }
+
+            // Expand the leaf (if not terminal and not yet expanded)
+            if !leaf_game.is_game_over() && current.children.is_empty() {
                 let key = Self::board_key(leaf_game);
                 let cache = self.eval_cache.borrow();
                 if let Some(cached) = cache.get(&key) {
@@ -465,7 +505,7 @@ impl<B: Backend> MctsSearch<B> {
         }
 
         // Backpropagate
-        self.backup(root, path, leaf_value);
+        Self::backup(root, path, leaf_game.current_player(), leaf_value);
     }
 
     /// Select best child using PUCT from parent perspective.
@@ -475,8 +515,13 @@ impl<B: Backend> MctsSearch<B> {
         let parent_sqrt = (node.visit_count.max(1) as f32).sqrt();
 
         for (index, child) in node.children.iter().enumerate() {
-            // child.q_value is from child perspective (opponent), so negate.
-            let q = -child.node.q_value();
+            // child.q_value は子ノードの手番視点の値なので、手番が同じ（パス）なら
+            // そのまま、違うなら符号を反転して親の視点に合わせる。
+            let q = if child.node.player == node.player {
+                child.node.q_value()
+            } else {
+                -child.node.q_value()
+            };
             let u = self.config.c_puct * child.node.prior * parent_sqrt
                 / (1.0 + child.node.visit_count as f32);
             let score = q + u;
@@ -494,7 +539,9 @@ impl<B: Backend> MctsSearch<B> {
     fn evaluate_node<G: Game + ?Sized>(&self, game: &G) -> MctsNode {
         if game.is_game_over() {
             let value = self.get_terminal_value(game, game.current_player());
-            return MctsNode::new_terminal(value);
+            let mut node = MctsNode::new_terminal(value);
+            node.player = game.current_player();
+            return node;
         }
 
         let key = Self::board_key(game);
@@ -536,28 +583,26 @@ impl<B: Backend> MctsSearch<B> {
         }
 
         let mut node = MctsNode::new(0.0);
+        node.player = game.current_player();
         node.total_value = value;
         node.children = children;
         node
     }
 
     /// Backup values up the tree.
-    fn backup(&self, root: &mut MctsNode, path: &[usize], leaf_value: f32) {
-        let mut value = if path.len().is_multiple_of(2) {
-            leaf_value
-        } else {
-            -leaf_value
-        };
-
+    ///
+    /// 値の符号は経路長のパリティではなく、各ノードの手番（[`MctsNode::player`]）と
+    /// リーフの手番が一致するかで決める。オセロはパスがあり 1 エッジで手番が
+    /// 入れ替わらないことがあるため、パリティでは誤った符号になる。
+    fn backup(root: &mut MctsNode, path: &[usize], leaf_player: Player, leaf_value: f32) {
         root.visit_count += 1;
-        root.total_value += value;
+        root.total_value += orient_for(root.player, leaf_player, leaf_value);
 
         let mut current = root;
         for &child_index in path {
-            value = -value;
             current = &mut current.children[child_index].node;
             current.visit_count += 1;
-            current.total_value += value;
+            current.total_value += orient_for(current.player, leaf_player, leaf_value);
         }
     }
 
@@ -679,7 +724,7 @@ impl<B: Backend> MctsSearch<B> {
     }
 
     /// Convert logits to probabilities using softmax
-    fn logits_to_probs(&self, logits: &burn::tensor::Tensor<B, 2>) -> Vec<f32> {
+    fn logits_to_probs(&self, logits: &Tensor<2>) -> Vec<f32> {
         let probs = softmax(logits.clone(), 1);
         let probs_data = probs.to_data();
         probs_data.as_slice::<f32>().unwrap().to_vec()
@@ -754,7 +799,7 @@ impl<B: Backend> MctsSearch<B> {
     }
 
     /// Get device
-    pub fn device(&self) -> &B::Device {
+    pub fn device(&self) -> &Device {
         &self.device
     }
 
@@ -797,4 +842,54 @@ pub fn select_move(move_probs: &[(usize, usize, f32)], temperature: f32) -> Opti
     }
 
     move_probs.last().map(|(r, c, _)| (*r, *c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(move_idx: u8, player: Player) -> MctsChild {
+        let mut node = MctsNode::new(0.5);
+        node.player = player;
+        MctsChild { move_idx, node }
+    }
+
+    /// パスで手番が入れ替わらない枝では、値の符号が反転しないこと
+    #[test]
+    fn backup_orientation_handles_forced_passes() {
+        // 根（黒）→ 子（パスにより手番が戻ってきた黒）
+        let mut root = MctsNode::new(0.5);
+        root.player = Player::Black;
+        root.children
+            .push(child((2 * BOARD_SIZE + 3) as u8, Player::Black));
+
+        MctsSearch::backup(&mut root, &[0], Player::Black, 1.0);
+
+        assert_eq!(root.visit_count, 1);
+        assert_eq!(root.children[0].node.visit_count, 1);
+        assert_eq!(root.total_value, 1.0);
+        assert_eq!(root.children[0].node.total_value, 1.0);
+    }
+
+    /// 手番が入れ替わる通常の枝では符号が反転すること
+    #[test]
+    fn backup_orientation_alternates_players() {
+        let mut root = MctsNode::new(0.5);
+        root.player = Player::Black;
+        root.children
+            .push(child((2 * BOARD_SIZE + 3) as u8, Player::White));
+
+        // 白のリーフが +1（白視点）→ 黒の根では -1
+        MctsSearch::backup(&mut root, &[0], Player::White, 1.0);
+
+        assert_eq!(root.total_value, -1.0);
+        assert_eq!(root.children[0].node.total_value, 1.0);
+    }
+
+    /// 選択時の Q 値も手番の一致で符号が決まること
+    #[test]
+    fn orient_for_uses_player_identity() {
+        assert_eq!(orient_for(Player::Black, Player::Black, 0.5), 0.5);
+        assert_eq!(orient_for(Player::White, Player::Black, 0.5), -0.5);
+    }
 }

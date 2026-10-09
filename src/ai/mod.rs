@@ -12,11 +12,11 @@ pub use restrictive::RestrictiveAi;
 use alphazero::player::AlphaZeroPlayer;
 use alphazero::{AlphaZeroModel, AlphaZeroModelConfig, MctsConfig, MctsSearch};
 
-/// Path to the trained model file for Hard difficulty
-pub const HARD_MODEL_PATH: &str = "checkpoints/best_model";
+/// Path to the trained model file for Hard difficulty (burnpack 形式)
+pub const HARD_MODEL_PATH: &str = "checkpoints/best_model.bpk";
 
-/// Path to the trained artistic model file for Honrou difficulty
-pub const HONROU_MODEL_PATH: &str = "checkpoints/honrou_model";
+/// Path to the trained artistic model file for Honrou difficulty (burnpack 形式)
+pub const HONROU_MODEL_PATH: &str = "checkpoints/honrou_model.bpk";
 
 /// AIプレイヤーのインターフェース
 /// ゲーム状態を受け取り、最適な手（row, col）を返す
@@ -113,15 +113,13 @@ pub fn create_ai(difficulty: AiDifficulty, player: Player) -> Box<dyn AiPlayer> 
 
 /// AlphaZero AIを生成する。モデルファイルが存在すれば読み込み、なければフォールバック。
 fn create_alphazero_ai(player: Player, model_path: &str) -> Box<dyn AiPlayer> {
-    use burn::backend::ndarray::NdArray;
+    use burn::tensor::Device;
 
-    type InferBackend = NdArray;
-
-    let device = burn::backend::ndarray::NdArrayDevice::default();
+    // CPU 推論には pure-Rust の Flex バックエンドを使う
+    let device = Device::flex();
     let config = AlphaZeroModelConfig::new();
 
-    if let Some(model) = AlphaZeroModel::<InferBackend>::load_trained(&config, model_path, &device)
-    {
+    if let Some(model) = AlphaZeroModel::load_trained(&config, model_path, &device) {
         let mcts_config = MctsConfig {
             num_simulations: 800,
             max_search_time_ms: Some(2000),

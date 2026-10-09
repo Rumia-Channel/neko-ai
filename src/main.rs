@@ -69,6 +69,84 @@ fn main() {
     }
 }
 
+/// 日本語表示に使うフォントの探索候補（先頭ほど優先）。
+///
+/// リポジトリ同梱の BIZ UDPGothic を最優先し、無ければ OS 標準の日本語フォントを使う。
+fn japanese_font_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut candidates = vec![PathBuf::from(
+        "fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf",
+    )];
+
+    // 実行ファイル相対（配布バイナリや target/release からの起動用）
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf"));
+        candidates.push(dir.join("../fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf"));
+    }
+
+    // OS 標準フォントのディレクトリ
+    let font_dir = if cfg!(windows) {
+        std::env::var("SystemRoot")
+            .map(|root| PathBuf::from(root).join("Fonts"))
+            .unwrap_or_else(|_| PathBuf::from("C:\\Windows\\Fonts"))
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from("/System/Library/Fonts")
+    } else {
+        PathBuf::from("/usr/share/fonts")
+    };
+
+    for name in [
+        "BIZ-UDGothicR.ttc", // Windows 同梱の BIZ UDGothic
+        "meiryo.ttc",
+        "YuGothM.ttc",
+        "msgothic.ttc",
+    ] {
+        candidates.push(font_dir.join(name));
+    }
+
+    // Linux / macOS の代表的な日本語フォント
+    for path in [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    ] {
+        candidates.push(PathBuf::from(path));
+    }
+
+    candidates
+}
+
+/// TrueType / OpenType のコンテナかどうかを先頭 4 バイトで判定する。
+///
+/// 壊れたファイルや HTML を掴んだまま egui に渡して panic するのを防ぐ。
+fn looks_like_font(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.get(..4),
+        Some(b"\x00\x01\x00\x00" | b"OTTO" | b"true" | b"ttcf")
+    )
+}
+
+/// 日本語フォントを探索して読み込む。見つかれば (パス, バイト列) を返す。
+fn load_japanese_font() -> Option<(std::path::PathBuf, Vec<u8>)> {
+    for path in japanese_font_candidates() {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if looks_like_font(&bytes) {
+            return Some((path, bytes));
+        }
+        eprintln!(
+            "警告: '{}' はフォント形式ではないため読み飛ばします",
+            path.display()
+        );
+    }
+    None
+}
+
 fn run_gui_mode() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 700.0]),
@@ -79,27 +157,35 @@ fn run_gui_mode() -> eframe::Result {
         "オセロ",
         options,
         Box::new(|cc| {
-            // Load Japanese font
+            // 日本語フォントは実行時に探索して読み込む。
+            // 同梱フォントは .gitignore 対象（*.ttf）のため include_bytes! で埋め込むと
+            // フォント未配置の環境でコンパイル自体が失敗してしまう。
             let mut fonts = egui::FontDefinitions::default();
 
-            // Load the custom font data
-            let font_data = include_bytes!("../fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf");
-            fonts.font_data.insert(
-                "japanese_font".to_owned(),
-                egui::FontData::from_owned(font_data.to_vec()).into(),
-            );
+            if let Some((path, font_bytes)) = load_japanese_font() {
+                println!("日本語フォントを読み込みました: {}", path.display());
+                fonts.font_data.insert(
+                    "japanese_font".to_owned(),
+                    egui::FontData::from_owned(font_bytes).into(),
+                );
 
-            // Add the font to the proportional and monospace families
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "japanese_font".to_owned());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push("japanese_font".to_owned());
+                // Add the font to the proportional and monospace families
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "japanese_font".to_owned());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .push("japanese_font".to_owned());
+            } else {
+                eprintln!(
+                    "警告: 日本語フォントが見つかりません。日本語は正しく表示されません。\n\
+                     フォントを配置する場合: fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf"
+                );
+            }
 
             cc.egui_ctx.set_fonts(fonts);
 
@@ -237,14 +323,11 @@ fn run_training_mode(profile: TrainingProfile) {
     println!("========================================\n");
     println!("Training profile: {}\n", profile.as_str());
 
-    use burn::backend::ndarray::NdArrayDevice;
+    use burn::tensor::Device;
 
-    type InferBackend = burn::backend::ndarray::NdArray;
-    type TrainBackend = burn::backend::Autodiff<InferBackend>;
-
-    // Setup device
-    let device = NdArrayDevice::default();
-    println!("Using device: CPU (NdArray)");
+    // CPU 推論・学習には pure-Rust の Flex バックエンドを使う
+    let device = Device::flex();
+    println!("Using device: CPU (Flex)");
 
     // Create model configuration
     let model_config = AlphaZeroModelConfig::new();
@@ -252,7 +335,7 @@ fn run_training_mode(profile: TrainingProfile) {
     println!("  - Residual blocks: {}", model_config.num_res_blocks);
     println!("  - Filters: {}", model_config.num_filters);
 
-    let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &device);
+    let self_play_model = AlphaZeroModel::new(&model_config, &device);
 
     let self_play_config = build_self_play_config(profile, false);
     println!("\nSelf-play configuration:");
@@ -267,17 +350,23 @@ fn run_training_mode(profile: TrainingProfile) {
     );
 
     println!("\nInitializing self-play engine...");
-    let mcts = MctsSearch::new(self_play_config.mcts_config, self_play_model, device);
-    let self_play = SelfPlayEngine::new(self_play_config, mcts, device);
+    let mcts = MctsSearch::new(
+        self_play_config.mcts_config,
+        self_play_model,
+        device.clone(),
+    );
+    let self_play = SelfPlayEngine::new(self_play_config, mcts, device.clone());
 
     println!("\n--- Starting Self-Play ---");
     let training_data = self_play.generate_data();
 
     println!("\n--- Starting Training ---");
-    let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &device);
+    // 学習は autodiff を有効にしたデバイスで行う
+    let training_device = device.clone().autodiff();
+    let training_model = AlphaZeroModel::new(&model_config, &training_device);
     let training_config = build_training_config(profile, false);
 
-    let mut trainer = Trainer::new(training_config, training_model, device);
+    let mut trainer = Trainer::new(training_config, training_model, training_device);
     trainer.train(&training_data);
 
     println!("\n========================================");
@@ -294,17 +383,13 @@ fn run_training_mode_gpu(profile: TrainingProfile) {
 
     #[cfg(feature = "wgpu")]
     {
-        use burn::backend::ndarray::NdArrayDevice;
-        use burn::backend::wgpu::WgpuDevice;
+        use burn::tensor::{Device, DeviceKind};
 
-        // Self-play uses CPU (NdArray) for inference — GPU batch_size=1 is slower
+        // Self-play uses CPU for inference — GPU batch_size=1 is slower
         // due to CPU↔GPU transfer overhead per simulation.
-        type InferBackend = burn::backend::ndarray::NdArray;
-        type TrainBackend = burn::backend::Autodiff<burn::backend::wgpu::Wgpu>;
-
-        let cpu_device = NdArrayDevice::default();
-        let gpu_device = WgpuDevice::default();
-        println!("Self-play device: CPU (NdArray)");
+        let cpu_device = Device::flex();
+        let gpu_device = Device::wgpu(DeviceKind::DefaultDevice);
+        println!("Self-play device: CPU (Flex)");
         println!("Training device:  GPU (WGPU)");
 
         let model_config = AlphaZeroModelConfig::new();
@@ -312,7 +397,7 @@ fn run_training_mode_gpu(profile: TrainingProfile) {
         println!("  - Residual blocks: {}", model_config.num_res_blocks);
         println!("  - Filters: {}", model_config.num_filters);
 
-        let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &cpu_device);
+        let self_play_model = AlphaZeroModel::new(&model_config, &cpu_device);
         let self_play_config = build_self_play_config(profile, true);
         println!("\nSelf-play configuration:");
         println!("  - Games: {}", self_play_config.num_games);
@@ -326,17 +411,22 @@ fn run_training_mode_gpu(profile: TrainingProfile) {
         );
 
         println!("\nInitializing self-play engine (CPU inference)...");
-        let mcts = MctsSearch::new(self_play_config.mcts_config, self_play_model, cpu_device);
-        let self_play = SelfPlayEngine::new(self_play_config, mcts, NdArrayDevice::default());
+        let mcts = MctsSearch::new(
+            self_play_config.mcts_config,
+            self_play_model,
+            cpu_device.clone(),
+        );
+        let self_play = SelfPlayEngine::new(self_play_config, mcts, cpu_device.clone());
 
         println!("\n--- Starting Self-Play ---");
         let training_data = self_play.generate_data();
 
         println!("\n--- Starting Training on GPU ---");
-        let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &gpu_device);
+        let training_device = gpu_device.autodiff();
+        let training_model = AlphaZeroModel::new(&model_config, &training_device);
         let training_config = build_training_config(profile, true);
 
-        let mut trainer = Trainer::new(training_config, training_model, gpu_device);
+        let mut trainer = Trainer::new(training_config, training_model, training_device);
         trainer.train(&training_data);
 
         println!("\n========================================");
@@ -359,20 +449,17 @@ fn run_training_mode_honrou(profile: TrainingProfile) {
     println!("========================================\n");
     println!("Training profile: {}\n", profile.as_str());
 
-    use burn::backend::ndarray::NdArrayDevice;
+    use burn::tensor::Device;
 
-    type InferBackend = burn::backend::ndarray::NdArray;
-    type TrainBackend = burn::backend::Autodiff<InferBackend>;
-
-    let device = NdArrayDevice::default();
-    println!("Using device: CPU (NdArray)");
+    let device = Device::flex();
+    println!("Using device: CPU (Flex)");
 
     let model_config = AlphaZeroModelConfig::new();
     println!("Initializing AlphaZero model (artistic)...");
     println!("  - Residual blocks: {}", model_config.num_res_blocks);
     println!("  - Filters: {}", model_config.num_filters);
 
-    let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &device);
+    let self_play_model = AlphaZeroModel::new(&model_config, &device);
 
     // Build artistic self-play config
     let mut self_play_config = build_self_play_config(profile, false);
@@ -406,14 +493,19 @@ fn run_training_mode_honrou(profile: TrainingProfile) {
     );
 
     println!("\nInitializing self-play engine (artistic)...");
-    let mcts = MctsSearch::new(self_play_config.mcts_config, self_play_model, device);
-    let self_play = SelfPlayEngine::new(self_play_config, mcts, device);
+    let mcts = MctsSearch::new(
+        self_play_config.mcts_config,
+        self_play_model,
+        device.clone(),
+    );
+    let self_play = SelfPlayEngine::new(self_play_config, mcts, device.clone());
 
     println!("\n--- Starting Self-Play (Artistic) ---");
     let training_data = self_play.generate_data();
 
     println!("\n--- Starting Training (Artistic) ---");
-    let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &device);
+    let training_device = device.clone().autodiff();
+    let training_model = AlphaZeroModel::new(&model_config, &training_device);
 
     // 翻弄用トレーニング設定: より長い学習で芸術的パターンを定着
     let mut training_config = build_training_config(profile, false);
@@ -422,7 +514,7 @@ fn run_training_mode_honrou(profile: TrainingProfile) {
     // 芸術的報酬は値の範囲が広いため、学習率を少し下げて安定化
     training_config.learning_rate *= 0.8;
 
-    let mut trainer = Trainer::new(training_config, training_model, device);
+    let mut trainer = Trainer::new(training_config, training_model, training_device);
     trainer.train(&training_data);
 
     // 翻弄モデルとして保存
@@ -446,15 +538,11 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
 
     #[cfg(feature = "wgpu")]
     {
-        use burn::backend::ndarray::NdArrayDevice;
-        use burn::backend::wgpu::WgpuDevice;
+        use burn::tensor::{Device, DeviceKind};
 
-        type InferBackend = burn::backend::ndarray::NdArray;
-        type TrainBackend = burn::backend::Autodiff<burn::backend::wgpu::Wgpu>;
-
-        let cpu_device = NdArrayDevice::default();
-        let gpu_device = WgpuDevice::default();
-        println!("Self-play device: CPU (NdArray)");
+        let cpu_device = Device::flex();
+        let gpu_device = Device::wgpu(DeviceKind::DefaultDevice);
+        println!("Self-play device: CPU (Flex)");
         println!("Training device:  GPU (WGPU)");
 
         let model_config = AlphaZeroModelConfig::new();
@@ -462,7 +550,7 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
         println!("  - Residual blocks: {}", model_config.num_res_blocks);
         println!("  - Filters: {}", model_config.num_filters);
 
-        let self_play_model = AlphaZeroModel::<InferBackend>::new(&model_config, &cpu_device);
+        let self_play_model = AlphaZeroModel::new(&model_config, &cpu_device);
 
         let mut self_play_config = build_self_play_config(profile, true);
         self_play_config.reward_mode = RewardMode::Artistic;
@@ -494,21 +582,26 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
         );
 
         println!("\nInitializing self-play engine (CPU inference, artistic)...");
-        let mcts = MctsSearch::new(self_play_config.mcts_config, self_play_model, cpu_device);
-        let self_play = SelfPlayEngine::new(self_play_config, mcts, NdArrayDevice::default());
+        let mcts = MctsSearch::new(
+            self_play_config.mcts_config,
+            self_play_model,
+            cpu_device.clone(),
+        );
+        let self_play = SelfPlayEngine::new(self_play_config, mcts, cpu_device.clone());
 
         println!("\n--- Starting Self-Play (Artistic) ---");
         let training_data = self_play.generate_data();
 
         println!("\n--- Starting Training on GPU (Artistic) ---");
-        let training_model = AlphaZeroModel::<TrainBackend>::new(&model_config, &gpu_device);
+        let training_device = gpu_device.autodiff();
+        let training_model = AlphaZeroModel::new(&model_config, &training_device);
 
         let mut training_config = build_training_config(profile, true);
         training_config.checkpoint_dir = Some("checkpoints".to_string());
         training_config.model_name = "honrou_model".to_string();
         training_config.learning_rate *= 0.8;
 
-        let mut trainer = Trainer::new(training_config, training_model, gpu_device);
+        let mut trainer = Trainer::new(training_config, training_model, training_device);
         trainer.train(&training_data);
 
         println!("\n========================================");
@@ -522,5 +615,77 @@ fn run_training_mode_honrou_gpu(profile: TrainingProfile) {
         println!("GPU support not enabled. Compile with --features wgpu");
         println!("Falling back to CPU mode...");
         run_training_mode_honrou(profile);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_known_font_containers() {
+        assert!(looks_like_font(&[0x00, 0x01, 0x00, 0x00, 0xFF]));
+        assert!(looks_like_font(b"OTTO____"));
+        assert!(looks_like_font(b"true____"));
+        assert!(looks_like_font(b"ttcf____"));
+    }
+
+    #[test]
+    fn rejects_non_font_data() {
+        assert!(!looks_like_font(b"<!DOCTYPE html>"));
+        assert!(!looks_like_font(b"\x89PNG"));
+        assert!(!looks_like_font(b""));
+        assert!(!looks_like_font(b"tt"));
+    }
+
+    #[test]
+    fn font_candidates_are_ordered_and_non_empty() {
+        let candidates = japanese_font_candidates();
+        assert!(candidates.len() > 1);
+        // リポジトリ同梱フォントが最優先であること
+        assert_eq!(
+            candidates[0],
+            std::path::PathBuf::from("fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf")
+        );
+    }
+
+    #[test]
+    fn training_profile_defaults_to_high_quality() {
+        let args = vec!["neko-ai".to_string(), "--training".to_string()];
+        assert_eq!(
+            TrainingProfile::from_args(&args),
+            TrainingProfile::HighQuality
+        );
+
+        let args = vec!["neko-ai".to_string(), "--fast".to_string()];
+        assert_eq!(TrainingProfile::from_args(&args), TrainingProfile::Fast);
+    }
+
+    #[test]
+    fn self_play_config_is_consistent_across_profiles() {
+        for profile in [
+            TrainingProfile::Fast,
+            TrainingProfile::Balanced,
+            TrainingProfile::HighQuality,
+        ] {
+            for is_gpu in [false, true] {
+                let config = build_self_play_config(profile, is_gpu);
+                assert!(config.num_games > 0);
+                assert!(config.mcts_config.num_simulations > 0);
+                assert_eq!(config.reward_mode, RewardMode::Standard);
+                assert!(
+                    config.mcts_config.min_simulations_before_stop
+                        <= config.mcts_config.num_simulations,
+                    "早期終了の下限が総シミュレーション数を超えている: {:?}",
+                    profile
+                );
+
+                let training = build_training_config(profile, is_gpu);
+                assert!(training.num_epochs > 0);
+                assert!(training.batch_size > 0);
+                assert!(training.learning_rate > 0.0);
+                assert_eq!(training.model_name, "best_model");
+            }
+        }
     }
 }

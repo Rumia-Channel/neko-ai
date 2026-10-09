@@ -58,6 +58,11 @@ pub trait Game: Send + Debug + CloneGame {
 
     fn make_move(&mut self, row: usize, col: usize);
 
+    /// 有効手が無い場合に手番を相手へ渡す。
+    ///
+    /// 相手にも有効手が無ければゲーム終了とする。
+    fn pass_turn(&mut self);
+
     fn has_valid_moves(&self, player: Player) -> bool;
 
     fn reset(&mut self);

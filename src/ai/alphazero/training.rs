@@ -6,12 +6,11 @@ use crate::ai::alphazero::model::AlphaZeroModel;
 use crate::ai::alphazero::self_play::TrainingExample;
 use crate::game::BOARD_SIZE;
 
-use burn::module::{AutodiffModule, Module};
+use burn::module::Module;
 use burn::nn::loss::{MseLoss, Reduction};
-use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::optim::{AdamConfig, GradientsParams, ModuleOptimizer};
 use burn::tensor::activation::log_softmax;
-use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData};
 use rand::seq::SliceRandom;
 
 /// Configuration for training
@@ -56,16 +55,19 @@ impl Default for TrainingConfig {
     }
 }
 
-/// Trainer with full GPU support
-pub struct Trainer<B: AutodiffBackend> {
+/// Trainer
+///
+/// burn 0.22 では autodiff がバックエンドのデコレータではなく実行時コンテキストになったため、
+/// 学習は「autodiff を有効にした [`Device`] の上でモデルとバッチを作る」ことで行う。
+pub struct Trainer {
     config: TrainingConfig,
-    model: Option<AlphaZeroModel<B>>,
-    device: B::Device,
+    model: Option<AlphaZeroModel>,
+    device: Device,
     mse_loss: MseLoss,
 }
 
-impl<B: AutodiffBackend> Trainer<B> {
-    pub fn new(config: TrainingConfig, model: AlphaZeroModel<B>, device: B::Device) -> Self {
+impl Trainer {
+    pub fn new(config: TrainingConfig, model: AlphaZeroModel, device: Device) -> Self {
         Self {
             config,
             model: Some(model),
@@ -86,7 +88,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         println!("  - Epochs: {}", self.config.num_epochs);
         println!("  - Batch size: {}", self.config.batch_size);
         println!("  - Initial learning rate: {}", self.config.learning_rate);
-        println!("  - Device: {:?}", std::any::type_name::<B>());
+        println!("  - Device: {:?}", self.device);
 
         let split_idx =
             (training_data.len() as f32 * (1.0 - self.config.validation_split)) as usize;
@@ -100,7 +102,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             val_data.len()
         );
 
-        let mut optimizer = AdamConfig::new().init::<B, AlphaZeroModel<B>>();
+        let mut optimizer = AdamConfig::new().init();
         let mut best_val_loss = f32::INFINITY;
         let mut previous_lr = self.learning_rate_at_epoch(0);
 
@@ -152,16 +154,13 @@ impl<B: AutodiffBackend> Trainer<B> {
         println!("Best validation loss: {:.6}", best_val_loss);
     }
 
-    fn train_epoch<O>(
+    fn train_epoch(
         &mut self,
         data: &[TrainingExample],
         shuffled_indices: &[usize],
-        optimizer: &mut O,
+        optimizer: &mut ModuleOptimizer,
         learning_rate: f64,
-    ) -> f32
-    where
-        O: Optimizer<AlphaZeroModel<B>, B>,
-    {
+    ) -> f32 {
         let mut total_loss = 0.0f32;
 
         let num_batches_total = data.len().div_ceil(self.config.batch_size);
@@ -186,16 +185,13 @@ impl<B: AutodiffBackend> Trainer<B> {
         }
     }
 
-    fn train_step<O>(
+    fn train_step(
         &mut self,
         data: &[TrainingExample],
         batch_indices: &[usize],
-        optimizer: &mut O,
+        optimizer: &mut ModuleOptimizer,
         learning_rate: f64,
-    ) -> f32
-    where
-        O: Optimizer<AlphaZeroModel<B>, B>,
-    {
+    ) -> f32 {
         let (board, target_policy, target_value) = self.make_batch(data, batch_indices);
 
         let model_ref = self
@@ -266,7 +262,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         &self,
         data: &[TrainingExample],
         batch_indices: &[usize],
-    ) -> (Tensor<B, 4>, Tensor<B, 2>, Tensor<B, 2>) {
+    ) -> (Tensor<4>, Tensor<2>, Tensor<2>) {
         let batch_size = batch_indices.len();
         let board_len = 3 * BOARD_SIZE * BOARD_SIZE;
         let policy_len = BOARD_SIZE * BOARD_SIZE;
@@ -284,21 +280,21 @@ impl<B: AutodiffBackend> Trainer<B> {
             values.push(example.value);
         }
 
-        let board = Tensor::<B, 4>::from_data(
+        let board = Tensor::<4>::from_data(
             TensorData::new(boards, [batch_size, 3, BOARD_SIZE, BOARD_SIZE]),
             &self.device,
         );
-        let target_policy = Tensor::<B, 2>::from_data(
+        let target_policy = Tensor::<2>::from_data(
             TensorData::new(policies, [batch_size, policy_len]),
             &self.device,
         );
         let target_value =
-            Tensor::<B, 2>::from_data(TensorData::new(values, [batch_size, 1]), &self.device);
+            Tensor::<2>::from_data(TensorData::new(values, [batch_size, 1]), &self.device);
 
         (board, target_policy, target_value)
     }
 
-    fn tensor_scalar(tensor: Tensor<B, 1>) -> f32 {
+    fn tensor_scalar(tensor: Tensor<1>) -> f32 {
         let data = tensor.to_data();
         let values = data.as_slice::<f32>().unwrap();
         values.first().copied().unwrap_or(0.0)
@@ -313,21 +309,20 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     /// Get the trained model
-    pub fn model(&self) -> &AlphaZeroModel<B> {
+    pub fn model(&self) -> &AlphaZeroModel {
         self.model
             .as_ref()
             .expect("Model should always be available when queried")
     }
 
     /// Take ownership of the model
-    pub fn into_model(self) -> AlphaZeroModel<B> {
+    pub fn into_model(self) -> AlphaZeroModel {
         self.model
             .expect("Model should always be available when consumed")
     }
 
-    /// Save model to file using safetensors format
+    /// Save model to file using the burnpack format (`.bpk`)
     fn save_model_stub(&self, checkpoint_dir: &str, filename: &str) {
-        use burn::record::DefaultFileRecorder;
         use std::fs;
 
         if let Err(e) = fs::create_dir_all(checkpoint_dir) {
@@ -335,10 +330,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             return;
         }
 
-        let path = format!("{}/{}", checkpoint_dir, filename);
-
-        use burn::record::FullPrecisionSettings;
-        let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
+        let path = format!("{}/{}.bpk", checkpoint_dir, filename);
 
         let model = self
             .model
@@ -346,9 +338,86 @@ impl<B: AutodiffBackend> Trainer<B> {
             .expect("Model should always be available when saving")
             .valid();
 
-        match model.save_file(&path, &recorder) {
+        match model.into_record().save(&path) {
             Ok(_) => println!("Model saved to {}", path),
             Err(e) => eprintln!("Failed to save model: {:?}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::alphazero::model::AlphaZeroModelConfig;
+
+    fn dummy_examples(count: usize) -> Vec<TrainingExample> {
+        let policy = vec![1.0 / (BOARD_SIZE * BOARD_SIZE) as f32; BOARD_SIZE * BOARD_SIZE];
+        (0..count)
+            .map(|_| TrainingExample {
+                board_tensor: vec![0.0; 3 * BOARD_SIZE * BOARD_SIZE],
+                target_policy: policy.clone(),
+                value: 0.0,
+            })
+            .collect()
+    }
+
+    fn tiny_model_config() -> AlphaZeroModelConfig {
+        AlphaZeroModelConfig::new()
+            .with_num_res_blocks(1)
+            .with_num_filters(8)
+    }
+
+    /// 実行時 autodiff で学習ステップが完走し、損失が有限であること
+    #[test]
+    fn training_step_runs_with_runtime_autodiff() {
+        let device = Device::flex();
+        let model_config = tiny_model_config();
+        let training_device = device.clone().autodiff();
+        let model = AlphaZeroModel::new(&model_config, &training_device);
+
+        let config = TrainingConfig {
+            num_epochs: 2,
+            batch_size: 2,
+            steps_per_epoch: 1,
+            validation_split: 0.5,
+            checkpoint_dir: None,
+            ..Default::default()
+        };
+
+        let examples = dummy_examples(4);
+        let mut trainer = Trainer::new(config, model, training_device);
+        trainer.train(&examples);
+
+        let loss = trainer.validate(&examples);
+        assert!(loss.is_finite(), "loss should be finite, got {loss}");
+    }
+
+    /// チェックポイントの保存と読み込みが往復できること（burnpack 形式）
+    #[test]
+    fn checkpoint_round_trip() {
+        let device = Device::flex();
+        let model_config = tiny_model_config();
+        let training_device = device.clone().autodiff();
+        let model = AlphaZeroModel::new(&model_config, &training_device);
+
+        let mut dir = std::env::temp_dir();
+        dir.push("neko-ai-checkpoint-test");
+        let dir_str = dir.to_string_lossy().to_string();
+
+        let trainer = Trainer::new(TrainingConfig::default(), model, training_device);
+        trainer.save_model_stub(&dir_str, "unit_test_model");
+
+        let mut path = dir.clone();
+        path.push("unit_test_model.bpk");
+        assert!(
+            path.exists(),
+            "checkpoint was not written: {}",
+            path.display()
+        );
+
+        // 推論用デバイスで読み直せること
+        let model_path = path.to_string_lossy().to_string();
+        let loaded = AlphaZeroModel::load_trained(&model_config, &model_path, &device);
+        assert!(loaded.is_some(), "checkpoint could not be loaded");
     }
 }

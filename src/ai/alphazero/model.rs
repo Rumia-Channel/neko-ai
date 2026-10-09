@@ -1,9 +1,9 @@
 use burn::config::Config;
 use burn::module::Module;
-use burn::nn::{Linear, LinearConfig, Relu, conv::Conv2d, conv::Conv2dConfig};
-use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
-use burn::tensor::Tensor;
-use burn::tensor::backend::Backend;
+use burn::nn::conv::{Conv2d, Conv2dConfig};
+use burn::nn::{Linear, LinearConfig, PaddingConfig2d, Relu};
+use burn::store::ModuleRecord;
+use burn::tensor::{Device, Tensor};
 use std::path::Path;
 
 use crate::game::BOARD_SIZE;
@@ -22,22 +22,22 @@ pub struct AlphaZeroModelConfig {
 
 /// Residual block for AlphaZero architecture
 #[derive(Module, Debug)]
-pub struct ResidualBlock<B: Backend> {
-    conv1: Conv2d<B>,
-    conv2: Conv2d<B>,
+pub struct ResidualBlock {
+    conv1: Conv2d,
+    conv2: Conv2d,
     relu: Relu,
 }
 
-impl<B: Backend> ResidualBlock<B> {
-    pub fn new(config: &AlphaZeroModelConfig, device: &B::Device) -> Self {
+impl ResidualBlock {
+    pub fn new(config: &AlphaZeroModelConfig, device: &Device) -> Self {
         let num_filters = config.num_filters;
 
         let conv1 = Conv2dConfig::new([num_filters, num_filters], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         let conv2 = Conv2dConfig::new([num_filters, num_filters], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         Self {
@@ -47,7 +47,7 @@ impl<B: Backend> ResidualBlock<B> {
         }
     }
 
-    pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, input: Tensor<4>) -> Tensor<4> {
         let residual = input.clone();
 
         let x = self.conv1.forward(input);
@@ -62,29 +62,29 @@ impl<B: Backend> ResidualBlock<B> {
 
 /// AlphaZero neural network with policy and value heads
 #[derive(Module, Debug)]
-pub struct AlphaZeroModel<B: Backend> {
+pub struct AlphaZeroModel {
     /// Initial convolution layer
-    initial_conv: Conv2d<B>,
+    initial_conv: Conv2d,
     relu: Relu,
 
     /// Residual blocks
-    res_blocks: Vec<ResidualBlock<B>>,
+    res_blocks: Vec<ResidualBlock>,
 
     /// Policy head: outputs move probabilities
-    policy_conv: Conv2d<B>,
-    policy_fc: Linear<B>,
+    policy_conv: Conv2d,
+    policy_fc: Linear,
 
     /// Value head: outputs board evaluation
-    value_conv: Conv2d<B>,
-    value_fc1: Linear<B>,
-    value_fc2: Linear<B>,
+    value_conv: Conv2d,
+    value_fc1: Linear,
+    value_fc2: Linear,
 
     /// Number of possible moves (BOARD_SIZE * BOARD_SIZE)
     num_moves: usize,
 }
 
-impl<B: Backend> AlphaZeroModel<B> {
-    pub fn new(config: &AlphaZeroModelConfig, device: &B::Device) -> Self {
+impl AlphaZeroModel {
+    pub fn new(config: &AlphaZeroModelConfig, device: &Device) -> Self {
         let num_filters = config.num_filters;
         let num_res_blocks = config.num_res_blocks;
         let board_size = BOARD_SIZE;
@@ -92,7 +92,7 @@ impl<B: Backend> AlphaZeroModel<B> {
 
         // Initial convolution: 3 channels (own, opponent, empty) -> num_filters
         let initial_conv = Conv2dConfig::new([3, num_filters], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         // Residual blocks
@@ -124,7 +124,7 @@ impl<B: Backend> AlphaZeroModel<B> {
     }
 
     /// Forward pass returning both policy and value
-    pub fn forward(&self, input: Tensor<B, 4>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    pub fn forward(&self, input: Tensor<4>) -> (Tensor<2>, Tensor<2>) {
         // Input: [batch, 3, 8, 8]
         let batch_size = input.dims()[0];
 
@@ -156,7 +156,7 @@ impl<B: Backend> AlphaZeroModel<B> {
     }
 
     /// Get policy (move probabilities) only
-    pub fn forward_policy(&self, input: Tensor<B, 4>) -> Tensor<B, 2> {
+    pub fn forward_policy(&self, input: Tensor<4>) -> Tensor<2> {
         let batch_size = input.dims()[0];
 
         let mut x = self.initial_conv.forward(input);
@@ -173,7 +173,7 @@ impl<B: Backend> AlphaZeroModel<B> {
     }
 
     /// Get value (board evaluation) only
-    pub fn forward_value(&self, input: Tensor<B, 4>) -> Tensor<B, 2> {
+    pub fn forward_value(&self, input: Tensor<4>) -> Tensor<2> {
         let batch_size = input.dims()[0];
 
         let mut x = self.initial_conv.forward(input);
@@ -196,43 +196,74 @@ impl<B: Backend> AlphaZeroModel<B> {
         self.num_moves
     }
 
-    /// Load a trained model from a safetensors file.
+    /// Load a trained model from a burnpack file (`.bpk`).
+    ///
     /// Returns None if the file does not exist or loading fails.
+    /// NOTE: burn 0.22 では記録形式が burnpack に変わり、旧 `.mpk` (MessagePack) の
+    /// チェックポイントは読み込めない（再学習が必要）。
     pub fn load_trained(
         config: &AlphaZeroModelConfig,
         path: &str,
-        device: &B::Device,
+        device: &Device,
     ) -> Option<Self> {
-        let full_path = format!("{}.mpk", path);
-        if !Path::new(&full_path).exists() {
+        if !Path::new(path).exists() {
             return None;
         }
 
-        let model = Self::new(config, device);
-        let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
-
-        match model.load_file(path, &recorder, device) {
-            Ok(loaded) => Some(loaded),
+        let record = match ModuleRecord::load(path) {
+            Ok(record) => record,
             Err(e) => {
                 eprintln!("Failed to load model from {}: {:?}", path, e);
-                None
+                return None;
             }
-        }
+        };
+
+        let model = Self::new(config, device);
+        Some(model.load_record(record))
     }
 }
 
-/// Training batch item
-#[derive(Debug, Clone)]
-pub struct TrainingItem {
-    pub board_tensor: Vec<f32>,
-    pub target_policy: Vec<f32>,
-    pub target_value: f32,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::alphazero::mcts::{MctsConfig, MctsSearch};
+    use crate::ai::alphazero::tensor_utils::game_to_tensor;
+    use crate::game::OthelloGame;
 
-/// Training batch structure
-#[derive(Debug, Clone)]
-pub struct TrainingBatch<B: Backend> {
-    pub board: Tensor<B, 4>,
-    pub target_policy: Tensor<B, 2>,
-    pub target_value: Tensor<B, 2>,
+    /// Flex デバイスで順伝播と MCTS が動作すること（burn 0.22 移行のスモークテスト）
+    #[test]
+    fn forward_and_mcts_search_run_on_flex_device() {
+        let device = Device::flex();
+        let config = AlphaZeroModelConfig::new()
+            .with_num_res_blocks(1)
+            .with_num_filters(8);
+        let model = AlphaZeroModel::new(&config, &device);
+
+        let game = OthelloGame::default();
+        let input = game_to_tensor(&game, &device);
+        let (policy_logits, value) = model.forward(input);
+        assert_eq!(policy_logits.dims(), [1, BOARD_SIZE * BOARD_SIZE]);
+        assert_eq!(value.dims(), [1, 1]);
+
+        // 価値は tanh 出力なので [-1, 1] に収まる
+        let value_data = value.to_data();
+        let value = value_data.as_slice::<f32>().unwrap()[0];
+        assert!((-1.0..=1.0).contains(&value), "value out of range: {value}");
+
+        let mcts_config = MctsConfig {
+            num_simulations: 12,
+            add_root_dirichlet_noise: false,
+            ..Default::default()
+        };
+        let mcts = MctsSearch::new(mcts_config, model, device);
+        let moves = mcts.search(&game);
+
+        // 初期局面の有効手は 4 つ
+        assert_eq!(moves.len(), 4, "unexpected moves: {moves:?}");
+        let total: f32 = moves.iter().map(|(_, _, p)| *p).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-3,
+            "probabilities should sum to 1, got {total}"
+        );
+    }
 }

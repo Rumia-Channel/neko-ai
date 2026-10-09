@@ -8,7 +8,7 @@ use crate::ai::alphazero::mcts::{MctsConfig, MctsSearch, select_move};
 use crate::ai::alphazero::tensor_utils::game_to_tensor;
 use crate::ai::{AiDifficulty, AiPlayer, create_ai};
 use crate::game::{BOARD_SIZE, Game, OthelloGame, Player};
-use burn::tensor::backend::Backend;
+use burn::tensor::Device;
 
 /// 報酬モード: 通常 (勝敗) または芸術 (翻弄用)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,14 +73,14 @@ pub struct TrainingExample {
 }
 
 /// Self-play engine
-pub struct SelfPlayEngine<B: Backend> {
+pub struct SelfPlayEngine {
     config: SelfPlayConfig,
-    mcts: MctsSearch<B>,
-    device: B::Device,
+    mcts: MctsSearch,
+    device: Device,
 }
 
-impl<B: Backend> SelfPlayEngine<B> {
-    pub fn new(config: SelfPlayConfig, mcts: MctsSearch<B>, device: B::Device) -> Self {
+impl SelfPlayEngine {
+    pub fn new(config: SelfPlayConfig, mcts: MctsSearch, device: Device) -> Self {
         Self {
             config,
             mcts,
@@ -412,7 +412,7 @@ impl<B: Backend> SelfPlayEngine<B> {
 
     /// Convert board to tensor format
     fn board_to_tensor(&self, game: &OthelloGame) -> Vec<f32> {
-        let tensor = game_to_tensor::<B>(game, &self.device);
+        let tensor = game_to_tensor(game, &self.device);
         let tensor_data = tensor.to_data();
         let data = tensor_data.as_slice::<f32>().unwrap();
         data.to_vec()

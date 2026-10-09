@@ -11,8 +11,18 @@ Rust で実装されたオセロゲーム GUI アプリケーション。AlphaZe
 
 ## 必要条件
 
-- Rust 1.75+ 
+- Rust 1.95+
 - （GPU 学習時）Vulkan/WebGPU 対応 GPU
+
+> **フォントについて**: 日本語表示用の BIZ UDPGothic はリポジトリに含まれていません
+> （`*.ttf` は .gitignore 対象）。アプリは起動時に
+> `fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf` を探し、無ければ OS 標準の日本語
+> フォント（Windows なら BIZ UDGothic / メイリオ等）を使います。
+> 同梱したい場合は上記パスにフォントを配置してください。
+
+> **学習済みモデルについて**: モデルは burnpack 形式（`.bpk`）で
+> `checkpoints/best_model.bpk`（難易度「難しい」）と `checkpoints/honrou_model.bpk`
+> （「翻弄」）に保存されます。未学習の場合は自動的に HonrouAi へフォールバックします。
 
 ## インストール
 
@@ -45,6 +55,14 @@ cargo run -- --training
 # wgpu フィーチャーが必要
 cargo run --features wgpu -- --training-gpu
 ```
+
+> **⚠ GPU 学習は現在ビルドできません（上流バグ）**: burn 0.22 の GPU バックエンドは
+> `cubecl-wgpu 0.11` 経由で `wgpu 30.0.1` を要求しますが、この版は Windows で
+> コンパイルできません（`wgpu-hal` が `windows 0.62` を要求する一方、依存の
+> `gpu-allocator 0.28` は `windows <= 0.62` 指定で 0.61 に解決されるため型が不一致）。
+> `wgpu 30.0.1` が最新のため現時点で回避策はありません。
+> 自己対戦・学習とも CPU（Flex バックエンド）で実行してください
+> （`--features wgpu` を付けなければ CPU のみでビルドされます）。
 
 ## AI 難易度
 

@@ -21,12 +21,25 @@ cargo run -- --training
 # Run training mode (GPU - requires wgpu feature)
 cargo run --features wgpu -- --training-gpu
 
+# Run training mode (Honrou / artistic reward)
+cargo run -- --training-honrou
+
 # Check without building
 cargo check
 
 # Check with all features
 cargo check --all-features
 ```
+
+NOTE: The `wgpu` feature enables the GPU (CubeCL/wgpu) backend used by
+`--training-gpu`. Without it, the binary builds CPU-only (Flex) and the GPU
+training modes fall back to CPU with a message.
+
+WARNING: the `wgpu` feature (and therefore `cargo check --all-features`) does **not**
+compile on Windows right now: `cubecl-wgpu 0.11` requires `wgpu 30.0.1`, whose
+`wgpu-hal` needs `windows 0.62` while its `gpu-allocator 0.28` dependency is capped at
+`windows <= 0.62` and resolves to 0.61. `wgpu 30.0.1` is the latest release, so there
+is no workaround except waiting for an upstream fix.
 
 ## Test Commands
 
@@ -131,7 +144,10 @@ src/
     │   ├── model.rs     # Neural network model
     │   ├── mcts.rs      # Monte Carlo Tree Search
     │   ├── self_play.rs # Self-play data generation
-    │   └── training.rs  # Model training
+    │   ├── training.rs  # Model training
+    │   ├── artistic.rs  # Artistic reward for Honrou (翻弄) training
+    │   ├── player.rs    # AlphaZeroPlayer: AiPlayer adapter
+    │   └── tensor_utils.rs # Board -> tensor conversion
     ├── honrou.rs        # Advanced AI strategy
     ├── monte_carlo.rs   # Monte Carlo AI
     └── restrictive.rs   # Restrictive strategy AI
@@ -149,15 +165,43 @@ cargo test
 ## Dependencies
 
 Key external crates:
-- `burn` (0.20.1): ML framework with cpu/webgpu/vulkan/ndarray features
-- `eframe` (0.33.3): GUI framework
+- `burn` (0.22.0): ML framework. Enabled features: `std`, `optim` (implies `autodiff`),
+  `flex`, `store`. `default-features = false`.
+  - CPU execution uses the pure-Rust **Flex** backend (`Device::flex()`); the `ndarray`
+    backend is deprecated in 0.22.
+  - The `cpu` (CubeCL CPU) feature is intentionally **not** enabled: it pulls
+    cubecl-cpu -> tracel-llvm -> liblzma-sys and builds an LLVM bundle.
+  - GPU backends (`webgpu` + `vulkan`) are enabled by this crate's own `wgpu` feature.
+- `eframe` (0.36.2): GUI framework, `default-features = false` with `glow` renderer.
+  - The default `wgpu` renderer is avoided because wgpu 30.0.1 does not compile on
+    Windows: `wgpu-hal` requires `windows 0.62` while its `gpu-allocator 0.28` dependency
+    is capped at `windows <= 0.62` (resolves to 0.61), so the types mismatch (LNK/E0277).
 - `rand` (0.10.0): Random number generation
+
+### burn 0.22 API notes (migrated from 0.20)
+
+- Tensors are `Tensor<D>` / `Tensor<D, Int>`: no backend type parameter.
+- Devices are runtime values: `Device::flex()`, `Device::wgpu(DeviceKind::DefaultDevice)`,
+  `Device::default()`. `Device::default()` panics if no backend feature is enabled.
+- Autodiff is a runtime device context: `let device = Device::flex().autodiff();`
+  Build the model *after* enabling it. `Autodiff<B>` / `AutodiffBackend` no longer exist.
+- Models derive `Module` without generics; optimizer is the concrete `ModuleOptimizer`
+  from `AdamConfig::new().init()`, stepped with `optimizer.step(lr, model, grads)`.
+- Checkpoints use the burnpack format (`.bpk`) via `model.into_record().save(path)` and
+  `ModuleRecord::load(path)` + `model.load_record(record)`. Old `.mpk` files (burn 0.20)
+  cannot be loaded — models must be retrained.
+- `PaddingConfig2d::Explicit(top, left, bottom, right)` now takes four values.
+- `eframe::App` requires `fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame)` and offers
+  `fn logic(&mut self, ctx, frame)` for non-drawing per-frame work (used for AI turns).
 
 ## Project-specific Notes
 
 - Game logic is trait-based (`Game` trait in `game/mod.rs`)
-- GUI uses immediate-mode rendering via egui
-- Japanese font is embedded at `fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf`
+- GUI uses immediate-mode rendering via egui; AI turns run on a background thread and are
+  applied from `GameApp::poll_ai_job` (never block the UI thread with `choose_move`)
+- Japanese font is loaded **at runtime** (`load_japanese_font` in `main.rs`): it searches
+  `fonts/BIZ_UDPGothic/BIZUDPGothic-Regular.ttf` first, then OS Japanese fonts.
+  The font file is not committed (`*.ttf` is gitignored), so it must never be `include_bytes!`-ed
 - Board size is fixed at 8x8 (`const BOARD_SIZE: usize = 8`)
 - AI difficulty levels: Easy, Medium, SlightlyHard, Hard, Honrou
 - Command-line args: `--training` (CPU mode), `--training-gpu` (GPU mode)
